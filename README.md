@@ -19,6 +19,11 @@ The script is **idempotent** — re-running it won't break anything.
 
 > **v1.1.0 breaking change**: the `--install-defaults / -p` flag was renamed to `--install-packages / -i`. The `-p` short flag is now used by `--prompt`. Update any scripts or documentation that referenced the old flag.
 
+> **Two invocation modes** — see [Selection rules](#selection-rules) below:
+>
+> - **RUN ALL mode** (`sudo ./setup.sh`, no flags) runs every default section plus any opt-in section whose required `.env` key is set. Opt-in sections whose required key is missing are quietly skipped.
+> - **Selective mode** (one or more `--<section>` flags) runs **only** the sections you named, minus any `--no-X` exclusions. Opt-in sections do **not** auto-enable from `.env` in this mode — pass the flag explicitly.
+
 ---
 
 ## Requirements
@@ -93,8 +98,39 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 
 ### Selection rules
 
-- **No section flag given** → ALL sections run (matches the original behaviour).
-- **Any section flag given** → ONLY those sections run, minus any `--no-X` exclusions. For example `--swap --no-fail2ban` runs only swap.
+The script has **two invocation modes**. Every invocation is one or the other.
+
+#### 1. RUN ALL mode — `sudo ./setup.sh` (no section flags)
+
+This is what you run on a fresh server. Every **default** section runs in order, **plus** any opt-in section whose required `.env` key is present. Opt-in sections whose required key is missing are silently skipped (the script never prompts you to enable them — they stay off).
+
+| Runs unconditionally | Runs only if its required `.env` key is set |
+|---|---|
+| timezone, hostname, firewall, ssh-key, swap, fail2ban, ssh-harden, apt-upgrade, msmtp | add-repo (`APT_REPOSITORIES`), install-defaults (`DEFAULT_PACKAGES`), prompt (`PROMPT_ENABLED`) |
+
+You can subtract any default section without leaving RUN ALL mode by adding `--no-<taskname>`. For example `sudo ./setup.sh --no-msmtp` runs everything except msmtp; `sudo ./setup.sh --no-msmtp --no-prompt` runs everything except msmtp and the prompt block. `--no-X` flags on sections that aren't even running are harmless.
+
+> **Why are `add-repo`, `install-defaults`, and `prompt` opt-in?** These mutate sources lists, install dozens of packages, or rewrite every user's `~/.bashrc` — all things you don't want done automatically on every host. You opt them in either by setting the relevant `.env` key (RUN ALL picks it up) or by passing the flag explicitly (selective mode).
+
+#### 2. Selective mode — `sudo ./setup.sh --<taskname> [...]`
+
+When **any** `--<section>` or `--no-<section>` flag is passed, the script switches out of RUN ALL and runs **only** the explicitly-enabled sections, minus any `--no-X` removals. For example:
+
+```bash
+sudo ./setup.sh --swap                                  # swap only
+sudo ./setup.sh --swap --firewall                       # swap + firewall
+sudo ./setup.sh --hostname web01 --swap                 # only swap, with hostname override
+sudo ./setup.sh --no-fail2ban --no-msmtp                # every default except fail2ban + msmtp
+```
+
+In selective mode, **opt-in sections do not auto-enable from `.env`** — pass the flag explicitly if you want them. For example `sudo ./setup.sh --add-repo` runs only `add-repo`, even when `APT_REPOSITORIES` is set (which would have triggered it in RUN ALL mode).
+
+Passing `--no-<section>` without its positive counterpart is allowed and behaves as "all defaults except X". For example `sudo ./setup.sh --no-msmtp` is the recipe for "full RUN ALL minus msmtp" without leaving RUN ALL mode.
+
+#### Common to both modes
+
+- **`--no-<taskname>` always wins.** Whether you're in RUN ALL or selective mode, `--no-firewall` removes firewall from the active set, period.
+- **`--non-interactive` / `-y`** skips all interactive prompts. In RUN ALL mode it auto-detects whether every required key is present in `.env` and turns itself on; pass `-y` to force it on (the script will exit with code `2` listing missing keys).
 - **Precedence** (highest to lowest): `CLI flag > .env value > interactive prompt > built-in default`. The `--hostname NAME` flag wins over `.env`'s `HOSTNAME`.
 - **Auto-detect non-interactive**: if you pass any section flag *and* `.env` contains every required value for those sections, the script runs non-interactively without needing `-y`. Pass `-y` to force non-interactive even with missing values (the script exits with code `2` and lists them).
 
