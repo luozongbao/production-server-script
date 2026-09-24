@@ -285,10 +285,14 @@ validate_timezone() {
 validate_hostname() {
   local h="$1"
   if [[ ${#h} -gt 253 ]]; then err "Hostname too long (max 253 chars)"; return 1; fi
-  if ! [[ "$h" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]; then
-    err "Invalid hostname: '$h' (expected RFC 1123, e.g. 'web-prod-01')"
+  # RFC 1123: each label must start with a letter (not digit), end with letter/digit
+  # Pure-numeric labels like "123" are technically valid per the loose regex but
+  # systemd rejects them with "Name or service not known".
+  if ! [[ "$h" =~ ^[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]; then
+    err "Invalid hostname: '$h' (expected RFC 1123, e.g. 'web-prod-01', must start with a letter)"
     return 1
   fi
+  return 0
 }
 
 validate_port_spec() {
@@ -414,6 +418,10 @@ if [[ "$NONINTERACTIVE" == "true" ]]; then
     if [[ -n "${ENV[FAIL2BAN_BANTIME]:-}" ]]; then
       [[ "${ENV[FAIL2BAN_BANTIME]}" =~ ^[0-9]+[mhd]?$ ]] || \
         { err "FAIL2BAN_BANTIME must be like 1h, 30m, 1d, or 3600"; exit 2; }
+    fi
+    if [[ -n "${ENV[FAIL2BAN_FINDTIME]:-}" ]]; then
+      [[ "${ENV[FAIL2BAN_FINDTIME]}" =~ ^[0-9]+[mhd]?$ ]] || \
+        { err "FAIL2BAN_FINDTIME must be like 1h, 30m, 1d, or 3600"; exit 2; }
     fi
     if [[ -n "${ENV[FAIL2BAN_MAXRETRY]:-}" ]]; then
       validate_positive_int "FAIL2BAN_MAXRETRY" "${ENV[FAIL2BAN_MAXRETRY]}" || exit 2
@@ -561,9 +569,14 @@ section_ssh_key() {
 
     if [[ -n "$file_pubkey" ]] && ! grep -qxF "$file_pubkey" "$auth_keys"; then
       local append_pref="${ENV[SSH_PUBLIC_KEY_APPEND]:-}"
-      if [[ "$append_pref" =~ ^[Tt]rue$ ]] || \
-         ([[ -z "$append_pref" ]] && [[ "$NONINTERACTIVE" != "true" ]] && \
-          ask "Append ssh_key.pub to authorized_keys"); then
+      if [[ "$append_pref" =~ ^[Tt]rue$ ]]; then
+        echo "$file_pubkey" >> "$auth_keys"
+        chown "$TARGET_USER":"$TARGET_USER" "$auth_keys"
+        ok "Appended public key"
+      elif [[ "$NONINTERACTIVE" == "true" ]]; then
+        # Silent skip is dangerous — admin may think new key was installed
+        warn "SSH_PUBLIC_KEY provided but not in authorized_keys — set SSH_PUBLIC_KEY_APPEND=true to install"
+      elif ask "Append ssh_key.pub to authorized_keys"; then
         echo "$file_pubkey" >> "$auth_keys"
         chown "$TARGET_USER":"$TARGET_USER" "$auth_keys"
         ok "Appended public key"
@@ -799,9 +812,9 @@ section_add_repo() {
     fi
     if [[ -z "$comps" ]]; then comps="main"; fi
 
-    echo "deb [signed-by=/etc/apt/keyrings/${name}.gpg] ${url} ${suite} ${comps}" > "$list_file"
-    ok "Wrote $list_file"
-
+    # Fetch signing key FIRST so we don't leave a broken sources.list if the fetch fails.
+    # Skip sources.list write entirely on key fetch failure.
+    local key_ok=true
     if [[ -n "$key_url" ]]; then
       mkdir -p /etc/apt/keyrings
       local fetch_cmd
@@ -810,14 +823,22 @@ section_add_repo() {
       else
         fetch_cmd="wget -qO-"
       fi
-      $fetch_cmd "$key_url" | gpg --dearmor -o "/etc/apt/keyrings/${name}.gpg" >/dev/null 2>&1 || {
-        warn "Failed to fetch key for $name from $key_url"
-      }
-      ok "Fetched key for $name"
+      if $fetch_cmd "$key_url" | gpg --dearmor -o "/etc/apt/keyrings/${name}.gpg" >/dev/null 2>&1; then
+        ok "Fetched key for $name"
+      else
+        warn "Failed to fetch key for $name from $key_url — skipping sources.list write"
+        skipped=$((skipped+1))
+        key_ok=false
+      fi
     else
       warn "No key URL for $name — you may need to add the signing key manually"
     fi
-    added=$((added+1))
+
+    if [[ "$key_ok" == "true" ]]; then
+      echo "deb [signed-by=/etc/apt/keyrings/${name}.gpg] ${url} ${suite} ${comps}" > "$list_file"
+      ok "Wrote $list_file"
+      added=$((added+1))
+    fi
   done
 
   info "Running apt-get update"
