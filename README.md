@@ -72,7 +72,7 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `--ssh-harden` | | Run the SSH-hardening advisory section |
 | `--no-ssh-harden` | | Skip the SSH-hardening advisory section |
 | `--non-interactive` | `-y` | Skip all prompts; fail fast on missing required values |
-| `--help` | | Show usage |
+| `--help` | `-h` | Show usage |
 
 ### Selection rules
 

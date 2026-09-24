@@ -69,7 +69,7 @@ Sections (composable; default if no section flag given: run all):
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
-      --help            Show this help
+  -h, --help            Show this help
 
 If no section flag is passed, ALL sections run.
 If any section flag is passed, ONLY those sections run (plus any --no-X
@@ -108,7 +108,7 @@ while (( $# > 0 )); do
     --ssh-harden)          FLAG_SSH_HARDEN=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(ssh-harden); shift ;;
     --no-ssh-harden)       FLAG_SSH_HARDEN=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(ssh-harden); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
-    --help)                usage; exit 0 ;;
+    -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
     -*)                    printf 'Unknown option: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
     *)                     printf 'Unexpected positional arg: %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
