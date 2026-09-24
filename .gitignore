@@ -1,0 +1,9 @@
+# Local secrets — never commit
+.env
+ssh_key.pub
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
