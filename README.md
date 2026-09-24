@@ -41,6 +41,46 @@ sudo ./setup.sh
 
 Any variable left blank in `.env` will trigger an interactive prompt at run time.
 
+## Quick Start — with CLI flags (selective sections)
+
+You can run only specific sections instead of the full sweep:
+
+```bash
+sudo ./setup.sh --swap                   # only create swap
+sudo ./setup.sh --swap --firewall        # swap + firewall
+sudo ./setup.sh --hostname web01 --swap  # override hostname, run only swap
+sudo ./setup.sh --no-fail2ban            # everything except fail2ban
+sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing values
+```
+
+### CLI flags
+
+| Flag | Short | Effect |
+|---|---|---|
+| `--timezone` | `-t` | Run the timezone section |
+| `--no-timezone` | | Skip the timezone section |
+| `--hostname NAME` | `-n` | Run the hostname section; `NAME` overrides `.env`/HOSTNAME |
+| `--no-hostname` | | Skip the hostname section |
+| `--firewall` | `-f` | Run the firewall section |
+| `--no-firewall` | | Skip the firewall section |
+| `--ssh-key` | `-k` | Run the SSH-key installation section |
+| `--no-ssh-key` | | Skip the SSH-key section |
+| `--swap` | `-s` | Run the swap section |
+| `--no-swap` | | Skip the swap section |
+| `--fail2ban` | `-b` | Run the fail2ban section |
+| `--no-fail2ban` | | Skip the fail2ban section |
+| `--ssh-harden` | | Run the SSH-hardening advisory section |
+| `--no-ssh-harden` | | Skip the SSH-hardening advisory section |
+| `--non-interactive` | `-y` | Skip all prompts; fail fast on missing required values |
+| `--help` | | Show usage |
+
+### Selection rules
+
+- **No section flag given** → ALL sections run (matches the original behaviour).
+- **Any section flag given** → ONLY those sections run, minus any `--no-X` exclusions. For example `--swap --no-fail2ban` runs only swap.
+- **Precedence** (highest to lowest): `CLI flag > .env value > interactive prompt > built-in default`. The `--hostname NAME` flag wins over `.env`'s `HOSTNAME`.
+- **Auto-detect non-interactive**: if you pass any section flag *and* `.env` contains every required value for those sections, the script runs non-interactively without needing `-y`. Pass `-y` to force non-interactive even with missing values (the script exits with code `2` and lists them).
+
 ### Configured via `.env`
 
 | Variable | Purpose | Default | Required (when `NONINTERACTIVE=true`) |
