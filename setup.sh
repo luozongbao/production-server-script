@@ -977,7 +977,7 @@ if is_enabled ssh-key;   then
 fi
 if is_enabled apt-upgrade; then
   pkg_count=$(dpkg -l 2>/dev/null | wc -l)
-  ok "apt:          $pkg_count packages installed"
+  ok "apt:          $pkg_count packages on system"
 fi
 if is_enabled add-repo; then
   repo_count=$(ls /etc/apt/sources.list.d/*.list 2>/dev/null | wc -l)
