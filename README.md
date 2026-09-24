@@ -9,6 +9,7 @@ A single Bash script that brings a fresh Ubuntu/Debian server to a sane producti
 5. **Swap** — optional swapfile at `/swapfile` with sensible swappiness
 6. **fail2ban** — install and enable the SSH jail with configurable bantime/findtime/maxretry
 7. **SSH hardening** — *advisory only*; prints recommended `sshd_config` and the manual commands to apply them safely
+8. **apt update + upgrade** — runs `apt-get update && apt-get upgrade` (and optional `autoremove`) to bring the system up to date
 
 The script is **idempotent** — re-running it won't break anything.
 
@@ -73,6 +74,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `--no-ssh-harden` | | Skip the SSH-hardening advisory section |
 | `--non-interactive` | `-y` | Skip all prompts; fail fast on missing required values |
 | `--help` | `-h` | Show usage |
+| `--apt-upgrade` | `-u` | Run `apt update` + `apt upgrade` |
+| `--no-apt-upgrade` | | Skip `apt update` + `apt upgrade` |
 
 ### Selection rules
 
@@ -96,6 +99,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `FAIL2BAN_BANTIME` | ban duration, e.g. `1h`, `30m`, `1d` | `1h` | no |
 | `FAIL2BAN_FINDTIME` | counter window, e.g. `10m`, `1h` | `10m` | no |
 | `FAIL2BAN_MAXRETRY` | failures before ban | `5` | no |
+| `APT_UPGRADE` | `true` = run `apt-get update && apt-get upgrade -y` | `true` | yes |
+| `APT_AUTOREMOVE` | `true` = also run `apt-get autoremove -y` | `false` | no |
 | `NONINTERACTIVE` | `true` = skip all prompts, fail on missing | `false` | — |
 
 > **Note on SSH key storage:** the preferred approach is to put your key in a separate file named `ssh_key.pub` in the same directory — no quoting headaches, and easy to `.gitignore`. The script uses `ssh_key.pub` if it exists, then falls back to `SSH_PUBLIC_KEY` in `.env`, then prompts.

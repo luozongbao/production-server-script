@@ -42,6 +42,7 @@ FLAG_SSH_KEY=""
 FLAG_SWAP=""
 FLAG_FAIL2BAN=""
 FLAG_SSH_HARDEN=""
+FLAG_APT_UPGRADE=""
 FLAG_NONINTERACTIVE="false"
 CLI_FLAG_GIVEN=false
 CLI_ENABLE_LIST=()   # section names explicitly enabled via CLI
@@ -66,6 +67,8 @@ Sections (composable; default if no section flag given: run all):
       --no-fail2ban     Skip fail2ban
   -h, --ssh-harden      Show SSH hardening recommendations (advisory)
       --no-ssh-harden   Skip SSH hardening advisory
+  -u, --apt-upgrade     Run apt update + upgrade (and optionally autoremove)
+      --no-apt-upgrade  Skip apt update + upgrade
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
@@ -107,6 +110,8 @@ while (( $# > 0 )); do
     --no-fail2ban)         FLAG_FAIL2BAN=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(fail2ban); shift ;;
     --ssh-harden)          FLAG_SSH_HARDEN=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(ssh-harden); shift ;;
     --no-ssh-harden)       FLAG_SSH_HARDEN=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(ssh-harden); shift ;;
+    -u|--apt-upgrade)      FLAG_APT_UPGRADE=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(apt-upgrade); shift ;;
+    --no-apt-upgrade)      FLAG_APT_UPGRADE=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(apt-upgrade); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -309,6 +314,7 @@ required_keys_for_section() {
     swap)      echo "SWAP_SIZE_MB" ;;
     fail2ban)  echo "FAIL2BAN_ENABLED" ;;
     ssh-harden) echo "" ;;  # no required key
+    apt-upgrade) echo "APT_UPGRADE" ;;
   esac
 }
 
@@ -316,7 +322,7 @@ if [[ "$NONINTERACTIVE" == "false" ]]; then
   # Check if all required keys for enabled sections are present in .env
   auto_ok=true
   auto_missing=()
-  for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden; do
+  for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade; do
     is_enabled "$sec" || continue
     rk=$(required_keys_for_section "$sec")
     [[ -z "$rk" ]] && continue
@@ -396,7 +402,7 @@ fi
 # Show plan
 # ===========================================================================
 section "Plan"
-info "Sections enabled: $(for s in timezone hostname firewall ssh-key swap fail2ban ssh-harden; do is_enabled "$s" && printf '%s ' "$s"; done)"
+info "Sections enabled: $(for s in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade; do is_enabled "$s" && printf '%s ' "$s"; done)"
 info "Mode: $([[ "$NONINTERACTIVE" == "true" ]] && echo non-interactive || echo interactive)"
 [[ -f "$ENV_FILE" ]] && info "Config: $ENV_FILE"
 echo
@@ -669,8 +675,7 @@ EOF
 # ===========================================================================
 # Section: ssh-harden (advisory)
 # ===========================================================================
-section_ssh_harden() {
-  section "SSH hardening — ADVISORY ONLY"
+section_ssh_harden() {  section "SSH hardening — ADVISORY ONLY"
   info "Recommended /etc/ssh/sshd_config settings:"
   cat <<'EOF'
     PasswordAuthentication no
@@ -705,6 +710,35 @@ EOF
 }
 
 # ===========================================================================
+# Section: apt-upgrade
+# ===========================================================================
+section_apt_upgrade() {
+  section "apt update + upgrade"
+  if ! command -v apt-get >/dev/null 2>&1; then
+    warn "apt-get not found — skipping (this script targets Debian/Ubuntu)"
+    return 0
+  fi
+
+  local apply
+  apply=$(env_or_prompt "APT_UPGRADE (true/false)" "true") || return 1
+  if ! [[ "$apply" =~ ^[Tt]rue$ ]]; then
+    info "APT_UPGRADE=$apply — skipping"
+    return 0
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  info "Running apt-get update"
+  apt-get update -qq
+  info "Running apt-get upgrade"
+  apt-get upgrade -y -qq
+  if [[ "${ENV[APT_AUTOREMOVE]:-false}" =~ ^[Tt]rue$ ]]; then
+    info "Running apt-get autoremove"
+    apt-get autoremove -y -qq
+  fi
+  ok "apt update + upgrade complete"
+}
+
+# ===========================================================================
 # Dispatch — run only enabled sections
 # ===========================================================================
 SECTIONS_RUN=()
@@ -729,6 +763,7 @@ run_section ssh-key     section_ssh_key
 run_section swap        section_swap
 run_section fail2ban    section_fail2ban
 run_section ssh-harden  section_ssh_harden
+run_section apt-upgrade section_apt_upgrade
 
 # ===========================================================================
 # Summary
@@ -750,6 +785,10 @@ if is_enabled ssh-key;   then
   ssh_dir="$TARGET_HOME/.ssh"
   auth_keys="$ssh_dir/authorized_keys"
   ok "SSH keys:     $([[ -s "$auth_keys" ]] && echo "installed ($auth_keys)" || echo "NONE")"
+fi
+if is_enabled apt-upgrade; then
+  pkg_count=$(dpkg -l 2>/dev/null | wc -l)
+  ok "apt:          $pkg_count packages installed"
 fi
 if (( ${#SECTIONS_FAILED[@]} > 0 )); then
   warn "Failed sections: ${SECTIONS_FAILED[*]}"
