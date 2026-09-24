@@ -13,7 +13,7 @@ A single Bash script that brings a fresh Ubuntu/Debian server to a sane producti
 9. **Add 3rd-party APT repositories** — *opt-in via `--add-repo`*. Adds repositories from `APT_REPOSITORIES`, then runs `apt update`. Does **not** run upgrade.
 10. **Install baseline server packages** — *opt-in via `--install-packages`*. Installs the package list from `DEFAULT_PACKAGES` in `.env` (skip already-installed). Comment out packages you don't want.
 11. **Custom shell prompt** — *opt-in via `--prompt`*. Appends a guarded, idempotent colored PS1 block to `~/.bashrc` showing date/time, user@host, working directory, and (inside git repos) the current branch. The PS1 template is user-configurable via `PROMPT_PS1_TEMPLATE` in `.env`; leave blank to use the built-in default.
-12. **msmtp SMTP client** — *opt-in via `--msmtp`*. Installs `msmtp`/`msmtp-mta` via apt if missing, then writes a per-user `~/.msmtprc` (mode 0600) from the `MSMTP_*` values in `.env`. Optionally also writes `/root/.msmtprc` for cron/systemd, and optionally sends a one-shot test email to verify the config end-to-end.
+12. **msmtp SMTP client** — runs in **RUN ALL** by default (skip with `--no-msmtp`; run in selective mode with `--msmtp / -m`). Installs `msmtp`/`msmtp-mta` via apt if missing, prompts for the SMTP password interactively, then writes a per-user `~/.msmtprc` (mode 0600) from the `MSMTP_*` values in `.env`.
 
 The script is **idempotent** — re-running it won't break anything.
 
@@ -88,8 +88,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `--no-install-packages` | | Skip install-packages |
 | `--prompt` | `-p` | Install managed colored PS1 block into `~/.bashrc` |
 | `--no-prompt` | | Skip prompt customization |
-| `--msmtp` | `-m` | Configure msmtp SMTP client (install if missing, write `~/.msmtprc`) |
-| `--no-msmtp` | | Skip msmtp configuration |
+| `--msmtp` | `-m` | Configure msmtp SMTP client (install if missing, write `~/.msmtprc`). Runs in RUN ALL by default; this flag is for selective invocations. |
+| `--no-msmtp` | | Skip msmtp configuration (override the RUN ALL default) |
 
 ### Selection rules
 
@@ -119,14 +119,10 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `DEFAULT_PACKAGES` | space-separated package list (comment with `#`) | rich default | no |
 | `PROMPT_ENABLED` | `true` = install managed PS1 block into `~/.bashrc` | `true` | yes (when running prompt section) |
 | `PROMPT_PS1_TEMPLATE` | custom PS1 string with ANSI escapes; blank = built-in default | blank | no |
-| `MSMTP_ENABLED` | `true` = configure msmtp (install if missing, write `~/.msmtprc`) | blank | yes (when running msmtp section) |
-| `MSMTP_HOST` | SMTP server hostname | blank | yes |
+| `MSMTP_HOST` | SMTP server hostname | blank | yes (when running msmtp section) |
 | `MSMTP_PORT` | SMTP port (typically `587` for STARTTLS, `465` for SMTPS) | `587` | no |
-| `MSMTP_USER` | SMTP auth username | blank | yes |
+| `MSMTP_USER` | SMTP auth username | blank | yes (when running msmtp section) |
 | `MSMTP_FROM` | `From:` address; defaults to `MSMTP_USER` if blank | blank | no |
-| `MSMTP_PASSWORD_FILE` | path to file containing the SMTP password (one line) — used only in `--non-interactive` mode; see [Password handling](#password-handling) | blank | yes (when `--non-interactive`) |
-| `MSMTP_ROOT_CONFIG` | `true` = also write `/root/.msmtprc` for cron/systemd | blank | no |
-| `MSMTP_TEST_EMAIL_TO` | send a one-shot test email to this address after config | blank | no |
 | `NONINTERACTIVE` | `true` = skip all prompts, fail on missing | `false` | — |
 
 > **Note on SSH key storage:** the preferred approach is to put your key in a separate file named `ssh_key.pub` in the same directory — no quoting headaches, and easy to `.gitignore`. The script uses `ssh_key.pub` if it exists, then falls back to `SSH_PUBLIC_KEY` in `.env`, then prompts.
@@ -295,33 +291,43 @@ To remove the block entirely, set `PROMPT_ENABLED=false` in `.env` and re-run.
 
 ## msmtp SMTP client
 
-When `MSMTP_ENABLED=true` **or** when `--msmtp / -m` is passed, the script configures `msmtp` so that the server (and its users) can send mail directly via an external SMTP relay — useful for `cron`, `systemd` timer reports (like [server-report-script](https://github.com/luozongbao/server-report-script)), `at` jobs, and ad-hoc alerting.
+The script configures `msmtp` so that the server (and its users) can send mail directly via an external SMTP relay — useful for `cron`, `systemd` timer reports (like [server-report-script](https://github.com/luozongbao/server-report-script)), `at` jobs, and ad-hoc alerting. This section runs in **RUN ALL** by default — skip it with `--no-msmtp`, or invoke it on its own with `--msmtp / -m`.
 
 ### What the section does
 
-1. **Installs** `msmtp` and `msmtp-mta` via `apt-get` if they are not already present. `apt-get install` is skipped silently when both packages are already installed.
-2. **Writes `~/.msmtprc`** for `TARGET_USER` using the `MSMTP_*` values from `.env`. File permissions are `0600`, owner is the target user.
-3. **Optionally writes `/root/.msmtprc`** when `MSMTP_ROOT_CONFIG=true` — needed for cron jobs and systemd timers that run as root and need their own SMTP config (cron can't read another user's `~/.msmtprc`).
-4. **Optionally sends a test email** when `MSMTP_TEST_EMAIL_TO` is set to a valid `addr@host` — verifies the full TLS/auth path end-to-end after the config is written.
+1. **Installs** `msmtp` and `msmtp-mta` via `apt-get` if they are not already present.
+2. **Validates required `.env` keys** (`MSMTP_HOST`, `MSMTP_USER`). If either is blank the section exits non-zero with a clear "set these keys in `.env`" message — no partial state is left behind.
+3. **Prompts for the SMTP password** silently (`read -s`) and asks you to type it twice. Mismatch → re-prompt loop. The password never lives anywhere on disk except inside the generated `~/.msmtprc`.
+4. **Asks `[o]verwrite / [a]bort`** when `~/.msmtprc` already exists. Default is overwrite; choosing overwrite creates a timestamped backup first (`.msmtprc.bak.YYYYMMDD-HHMMSS`). Merge was deliberately not implemented — see [Existing `~/.msmtprc` handling](#existing-msmtprc-handling).
+5. **Writes a fresh `~/.msmtprc`** for `TARGET_USER` using the `.env` values plus the password you just typed. File permissions are `0600`, owner is the target user.
 
-### Auto-detect / opt-in gate
+### Trigger model
 
-This section is **explicit opt-in**: it is a no-op (does not prompt) unless `MSMTP_ENABLED=true` or `--msmtp` is passed. This is intentional — without the gate, a host that already has `msmtp` installed (e.g. pulled in by `cron` or some Debian metapackage) would still hit interactive prompts if `.env` had blank `MSMTP_*` values.
+There is no `MSMTP_ENABLED` flag. Instead:
+
+- `sudo ./setup.sh` (no flags) — RUN ALL — **msmtp section runs**.
+- `sudo ./setup.sh --msmtp` — only the msmtp section runs (everything else skipped).
+- `sudo ./setup.sh --no-msmtp` — msmtp section skipped, everything else runs.
+- `sudo ./setup.sh --msmtp --non-interactive` — fails fast: the section requires an interactive TTY for the password prompt.
 
 ### Required .env keys
 
-For interactive runs, the only required key is:
+Two keys are required when the section runs (`MSMTP_FROM` and `MSMTP_PORT` are optional):
 
 ```bash
-MSMTP_ENABLED=true
 MSMTP_HOST=smtp.example.com
 MSMTP_USER=alerts@example.com
-MSMTP_FROM=alerts@example.com   # optional, defaults to MSMTP_USER
+# optional:
+MSMTP_PORT=587
+MSMTP_FROM=alerts@example.com
 ```
 
-The password is **never** read from `.env` — see [Password handling](#password-handling) below.
+The password is **never** read from `.env` — see [Password handling](#password-handling). If `MSMTP_HOST` or `MSMTP_USER` is blank when the section runs, the script exits non-zero with:
 
-If `MSMTP_ENABLED=true` but any of `MSMTP_HOST` / `MSMTP_USER` is blank, the script prompts interactively (unless `--non-interactive` is set, in which case it fails fast).
+```
+✗ missing required .env keys: MSMTP_HOST MSMTP_USER
+✗ set them in .env and re-run, or pass --no-msmtp to skip this section
+```
 
 ### Generated `~/.msmtprc`
 
@@ -350,46 +356,46 @@ password       app-password-here
 - The SMTP password is written **in plaintext** to `~/.msmtprc` (msmtp's standard format). This is the only way msmtp can read it. The file is `chmod 600` so only the owning user can read it.
 - The password is **never** stored in `.env` — see [Password handling](#password-handling). This avoids the dual-storage problem (same plaintext in two places) and removes the need to `chmod 600 .env`.
 - For Gmail, use an [App Password](https://myaccount.google.com/apppasswords), not your account password. For SendGrid, Mailgun, etc., use the provider's "SMTP credential", not the API key.
+- The script refuses to run the section non-interactively. If you need unattended setup, see [Unattended setup](#unattended-setup) below.
 
 ### Password handling
 
-There is no `MSMTP_PASSWORD` key in `.env` by design. The password is supplied via one of two paths:
-
-**Interactive mode (default)** — the section prompts silently, then prompts again to confirm. Mismatch → re-prompt, loop until match or you abort with Ctrl-C:
+The password is supplied via exactly one path: an interactive prompt at section-run time. There is no `MSMTP_PASSWORD` or `MSMTP_PASSWORD_FILE` key in `.env` by design — putting a plaintext credential in `.env` is a footgun (file checked into git by accident, copied around in backups, etc.).
 
 ```
   SMTP password: ********
   Confirm password: ********
 ```
 
-No echo on the terminal; the password only lives in a local Bash variable inside the function, and is `unset` immediately after `~/.msmtprc` is written (via a `trap ... RETURN`).
+- No echo on the terminal.
+- A mismatch re-prompts (loop until match or Ctrl-C).
+- An empty first entry re-prompts (no empty passwords).
+- The password only lives in a local Bash variable inside the function, and is `unset` immediately after `~/.msmtprc` is written (via `trap 'unset pass' RETURN`).
+- The script fails fast with a clear error if stdin is not a TTY (e.g. piped from `echo` or run under `sudo --non-interactive`).
 
-**Non-interactive mode (`--non-interactive`)** — point `MSMTP_PASSWORD_FILE` at a path that contains the password on a single line:
+### Existing `~/.msmtprc` handling
 
-```bash
-MSMTP_PASSWORD_FILE=/root/.msmtp.password
+If `/home/$TARGET_USER/.msmtprc` exists when the section starts, the script asks:
+
+```
+  /home/$TARGET_USER/.msmtprc already exists. [o]verwrite / [a]bort [o]:
 ```
 
-The file should be:
+- `[o]verwrite` (default) — creates a timestamped backup (`~/.msmtprc.bak.YYYYMMDD-HHMMSS`) with `cp -a` (preserves mode/owner), then writes a fresh config from current `.env` values.
+- `[a]bort` — exits cleanly, the existing file is left untouched. Useful when you have a hand-tuned `~/.msmtprc` that you don't want `setup.sh` to clobber.
 
-- Outside the repo (so it can't accidentally end up in git)
-- Mode `0400` or `0600`, owned by the user running `setup.sh` (usually root)
-- One line of password, no quoting, no trailing whitespace matters
+There is no "merge" option. Deciding what to keep and what to discard from an existing config is bug-prone (different field names, comments you want preserved, etc.) and the script's design is: the source of truth is `.env`, the output is fully regenerated every run.
 
-The section reads the first non-empty line, writes it into `~/.msmtprc`, then immediately `unset`s the local variable. The file itself is **not** modified or deleted — rotate the password by updating the file and re-running `setup.sh`.
+### Unattended setup
 
-Example setup:
+If you need to provision the server without a human at the terminal, the section's hard requirement is a TTY. Options:
 
-```bash
-sudo install -m 0400 -o root -g root /dev/null /root/.msmtp.password
-sudo $EDITOR /root/.msmtp.password     # paste the password, save, exit
-echo 'MSMTP_PASSWORD_FILE=/root/.msmtp.password' >> /path/to/.env
-sudo ./setup.sh --msmtp --non-interactive
-```
+- **Run `setup.sh` with a TTY** (e.g. `script -qc "sudo ./setup.sh --msmtp" /dev/null` or a CI runner with `tty: true`) and pipe the password via `expect`.
+- **Skip the section in unattended mode**, then write `/home/$TARGET_USER/.msmtprc` directly with your configuration-management tool of choice (Ansible, Salt, cloud-init, etc.).
 
 ### Re-running behavior
 
-The section overwrites `~/.msmtprc` on every run with the current `.env` values, so changing `MSMTP_PASSWORD` (after rotating it with your provider) and re-running `setup.sh` picks up the new credential with no manual edit. If the file does not exist before the run, it is created with mode `0600`; if it does exist, mode and ownership are re-applied (it may have been edited by hand — `setup.sh` will reset them, which is intentional).
+The section overwrites `~/.msmtprc` on every run with the current `.env` values + the password you typed, so rotating the SMTP password with your provider and re-running `setup.sh` picks up the new credential with no manual edit.
 
 If `apt-get install msmtp` fails (e.g. no network to the Debian mirror), the section aborts before touching any config files, so a half-installed state cannot happen.
 

@@ -139,7 +139,10 @@ done
 # (via CLI flag or .env-required-key presence). They never run on a bare
 # `sudo ./setup.sh` with no flags. Other sections default to enabled when
 # no flag is given, and to CLI_ENABLE_LIST when flags are given.
-OPT_IN_SECTIONS=(add-repo install-defaults prompt msmtp)
+# `msmtp` is intentionally NOT in OPT_IN_SECTIONS — it is part of RUN ALL
+# (sudo ./setup.sh with no flags), gated by --no-msmtp. Use --msmtp/-m in
+# selective runs. See issues/012.md for the design.
+OPT_IN_SECTIONS=(add-repo install-defaults prompt)
 _section_is_opt_in() {
   local s="$1"
   for o in "${OPT_IN_SECTIONS[@]}"; do [[ "$o" == "$s" ]] && return 0; done
@@ -346,7 +349,10 @@ required_keys_for_section() {
     add-repo)    echo "APT_REPOSITORIES" ;;
     install-defaults) echo "DEFAULT_PACKAGES" ;;
     prompt)      echo "PROMPT_ENABLED" ;;
-    msmtp)       echo "MSMTP_ENABLED" ;;
+    # msmtp has no required-key check: HOST/USER are required at section
+    # time (inside section_msmtp), not at auto-detect time. Adding a key
+    # here would just confuse the NONINTERACTIVE preflight, since the
+    # password is interactive-only by design.
   esac
 }
 
@@ -1031,28 +1037,18 @@ EOF
 # ===========================================================================
 # Section: msmtp — configure msmtp SMTP client (~/.msmtprc)
 #
-# Auto-detects whether msmtp is installed. If MSMTP_ENABLED=true and msmtp is
-# missing, installs it via apt. Writes a managed ~/.msmtprc for TARGET_USER
-# with mode 0600 (msmtp refuses to run with looser permissions). Optionally
-# also writes /root/.msmtprc for system cron jobs, and optionally sends a
-# test email to verify the config works end-to-end.
-#
-# All .env values are required when NONINTERACTIVE=true. When interactive,
-# missing values are prompted (password is read silently).
+# Installs msmtp + msmtp-mta via apt if missing, then writes a managed
+# ~/.msmtprc for TARGET_USER with mode 0600 (msmtp refuses to run with
+# looser permissions). Required .env keys: MSMTP_HOST, MSMTP_USER. The
+# password is ALWAYS prompted interactively (no .env secret, no password
+# file — by design). Fails fast if any required key is missing or stdin
+# is not a TTY.
 # ===========================================================================
 section_msmtp() {
   section "msmtp SMTP client configuration"
 
-  # Step 0: explicit opt-in gate. Without MSMTP_ENABLED=true this section
-  # is a no-op, even if msmtp happens to be installed on the system. This
-  # prevents the script from hanging on interactive prompts when users
-  # haven't asked for msmtp configuration.
-  if ! [[ "${ENV[MSMTP_ENABLED]:-}" =~ ^[Tt]rue$ ]]; then
-    info "MSMTP_ENABLED not true — skipping msmtp configuration"
-    return 0
-  fi
-
-  # Step 1: optionally install msmtp if requested and missing
+  # Step 1: install msmtp + msmtp-mta via apt if not present. .msmtprc is
+  # written for TARGET_USER even if msmtp was already on the system.
   if ! command -v msmtp >/dev/null 2>&1; then
     if ! command -v apt-get >/dev/null 2>&1; then
       warn "apt-get not found — cannot install msmtp automatically"
@@ -1067,85 +1063,71 @@ section_msmtp() {
     fi
   fi
 
-  # Step 2: bail if msmtp still not available (and not requested to install)
+  # Step 2: bail if msmtp still not available
   if ! command -v msmtp >/dev/null 2>&1; then
     info "msmtp not present and apt install failed — skipping"
     return 0
   fi
 
-  # Step 3: collect SMTP settings (host/port/user/from are non-secret, so we
-  # accept them via .env OR interactive prompt; the password is NEVER read
-  # from .env — see Step 3b).
+  # Step 3: read SMTP settings from .env. ALL required keys must be set;
+  # if any is blank we exit with a clear "set these keys" message instead
+  # of silently prompting for a secret-bearing value.
   local host="${ENV[MSMTP_HOST]:-}"
   local port="${ENV[MSMTP_PORT]:-587}"
   local user="${ENV[MSMTP_USER]:-}"
   local from="${ENV[MSMTP_FROM]:-}"
-
-  if [[ -z "$host" || -z "$user" ]]; then
-    if [[ "$NONINTERACTIVE" == "true" ]]; then
-      err "MSMTP_HOST and MSMTP_USER are required when NONINTERACTIVE=true"
-      return 1
-    fi
-    [[ -z "$host" ]] && { read -r -p "  SMTP host: " host; }
-    [[ -z "$port" ]] && { read -r -p "  SMTP port [587]: " port; port="${port:-587}"; }
-    [[ -z "$user" ]] && { read -r -p "  SMTP user: " user; }
-    [[ -z "$from" ]] && { read -r -p "  From address [$user]: " from; from="${from:-$user}"; }
-  fi
-  [[ -z "$from" ]] && from="$user"
-  [[ -z "$port" ]] && port="587"
-
-  # Step 3b: collect the SMTP password.
-  # The password is NEVER read from .env (no MSMTP_PASSWORD key by design).
-  # Two paths:
-  #   1. Interactive (default): prompt silently, then prompt again to confirm.
-  #      Mismatch → re-prompt. Loop until match or user aborts (Ctrl-C / EOF).
-  #   2. Non-interactive: MSMTP_PASSWORD_FILE points to a single-line file
-  #      containing the password. The file should be mode 0400 or 0600, NOT
-  #      inside the repo, and the password is consumed once (variable is
-  #      unset as soon as the .msmtprc is written).
-  local pass=""
-  if [[ -n "${ENV[MSMTP_PASSWORD_FILE]:-}" ]]; then
-    local pwfile="${ENV[MSMTP_PASSWORD_FILE]}"
-    if [[ ! -r "$pwfile" ]]; then
-      err "MSMTP_PASSWORD_FILE=$pwfile is not readable"
-      return 1
-    fi
-    # Read the first non-empty, non-comment line. Supports files where the
-    # user has put `# comment` or blank lines around the secret. Strip
-    # trailing CR (in case the file was edited on Windows).
-    pass=$(awk 'NF && !/^[[:space:]]*#/ {print; exit}' "$pwfile" | tr -d '\r')
-    [[ -z "$pass" ]] && { err "MSMTP_PASSWORD_FILE=$pwfile contains no usable password (only blanks/comments?)"; return 1; }
-  elif [[ "$NONINTERACTIVE" == "true" ]]; then
-    err "MSMTP password is required: set MSMTP_PASSWORD_FILE or run interactively"
+  local missing=()
+  [[ -z "$host" ]] && missing+=(MSMTP_HOST)
+  [[ -z "$user" ]] && missing+=(MSMTP_USER)
+  if (( ${#missing[@]} > 0 )); then
+    err "missing required .env keys: ${missing[*]}"
+    err "set them in .env and re-run, or pass --no-msmtp to skip this section"
     return 1
-  else
-    # Interactive: prompt + confirm loop. No echo on terminal.
-    while :; do
-      local pass1 pass2
-      read -r -s -p "  SMTP password: " pass1; echo
-      [[ -z "$pass1" ]] && { warn "password cannot be empty"; continue; }
-      read -r -s -p "  Confirm password: " pass2; echo
-      if [[ "$pass1" != "$pass2" ]]; then
-        warn "passwords do not match — try again (Ctrl-C to abort)"
-        continue
-      fi
-      pass="$pass1"
-      unset pass1 pass2
-      break
-    done
   fi
+  [[ -z "$port" ]] && port="587"
+  [[ -z "$from" ]] && from="$user"
+
+  # Step 4: collect the SMTP password interactively. Always — there is no
+  # MSMTP_PASSWORD_FILE path; the section refuses to run non-interactively.
+  # The password is NEVER stored in .env by design.
+  if [[ ! -t 0 ]]; then
+    err "msmtp requires interactive input (password); rerun without --non-interactive"
+    return 1
+  fi
+  local pass
+  while :; do
+    local pass1 pass2
+    read -r -s -p "  SMTP password: " pass1; echo
+    [[ -z "$pass1" ]] && { warn "password cannot be empty"; continue; }
+    read -r -s -p "  Confirm password: " pass2; echo
+    if [[ "$pass1" != "$pass2" ]]; then
+      warn "passwords do not match — try again (Ctrl-C to abort)"
+      continue
+    fi
+    pass="$pass1"
+    unset pass1 pass2
+    break
+  done
   # Belt + suspenders: never let the password linger in this function's
   # scope after the config file is written.
   trap 'unset pass' RETURN
 
-  # Step 4: write ~/.msmtprc (per-user)
+  # Step 5: existing /home/$TARGET_USER/.msmtprc → overwrite (default) or
+  # abort. Merge was considered and rejected (see issues/012.md §Design).
   local rcfile="$TARGET_HOME/.msmtprc"
-  # Ensure parent dir exists with correct ownership
-  mkdir -p "$(dirname "$rcfile")"
+  if [[ -f "$rcfile" ]]; then
+    local ans="o"
+    read -r -p "  $rcfile already exists. [o]verwrite / [a]bort [o]: " ans
+    case "$ans" in
+      a|A) info "aborted; existing $rcfile preserved"; return 0 ;;
+      *)   cp -a "$rcfile" "${rcfile}.bak.$(date +%Y%m%d-%H%M%S)" ;;
+    esac
+  fi
 
-  # Use a here-doc with no variable expansion for the static part, then
-  # printf the variable values directly — keeps the password from being
-  # accidentally mangled by globbing or word-splitting in the heredoc body.
+  # Step 6: write /home/$TARGET_USER/.msmtprc — full overwrite, mode 0600.
+  mkdir -p "$(dirname "$rcfile")"
+  install -m 0600 -o "$TARGET_USER" -g "$TARGET_USER" \
+    /dev/null "$rcfile"   # create or truncate, mode 0600, owner TARGET_USER
   cat > "$rcfile" <<'MSMTPRC_EOF'
 # Managed by production-server-script — do not edit by hand.
 # To update, edit MSMTP_* values in .env and re-run setup.sh.
@@ -1158,8 +1140,8 @@ logfile        ~/.msmtp.log
 
 account        default
 MSMTPRC_EOF
-  # Append the variable fields. Use printf with %s quoting to avoid
-  # interpretation of %, \, and special characters in passwords.
+  # Append the variable fields. printf with %s quoting keeps the password
+  # safe from globbing / word-splitting / %-expansion.
   {
     printf 'host           %s\n' "$host"
     printf 'port           %s\n' "$port"
@@ -1167,30 +1149,7 @@ MSMTPRC_EOF
     printf 'user           %s\n' "$user"
     printf 'password       %s\n' "$pass"
   } >> "$rcfile"
-
-  chown "$TARGET_USER":"$TARGET_USER" "$rcfile"
-  chmod 600 "$rcfile"
   ok "Wrote $rcfile (mode 600, owner $TARGET_USER)"
-
-  # Step 5: optionally also configure /root/.msmtprc for system cron
-  if [[ "${ENV[MSMTP_ROOT_CONFIG]:-}" =~ ^[Tt]rue$ ]]; then
-    install -m 0600 -o root -g root "$rcfile" /root/.msmtprc
-    ok "Wrote /root/.msmtprc (mode 600, owner root)"
-  fi
-
-  # Step 6: optional smoke test
-  local test_to="${ENV[MSMTP_TEST_EMAIL_TO]:-}"
-  if [[ "$test_to" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]]; then
-    info "Sending test email to $test_to"
-    local body
-    body=$(printf 'From: %s\nTo: %s\nSubject: setup.sh msmtp test\n\nTest from %s at %s.\n' \
-      "$from" "$test_to" "$(hostname)" "$(date)")
-    if printf '%s' "$body" | msmtp --file="$rcfile" "$test_to" >/dev/null 2>&1; then
-      ok "Test email sent to $test_to"
-    else
-      warn "Test email send failed — check $rcfile and ~/.msmtp.log"
-    fi
-  fi
 }
 
 # ===========================================================================
