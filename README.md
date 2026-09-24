@@ -11,9 +11,12 @@ A single Bash script that brings a fresh Ubuntu/Debian server to a sane producti
 7. **SSH hardening** — *advisory only*; prints recommended `sshd_config` and the manual commands to apply them safely
 8. **apt update + upgrade** — runs `apt-get update && apt-get upgrade` (and optional `autoremove`) to bring the system up to date
 9. **Add 3rd-party APT repositories** — *opt-in via `--add-repo`*. Adds repositories from `APT_REPOSITORIES`, then runs `apt update`. Does **not** run upgrade.
-10. **Install baseline server packages** — *opt-in via `--install-defaults`*. Installs the package list from `DEFAULT_PACKAGES` in `.env` (skip already-installed). Comment out packages you don't want.
+10. **Install baseline server packages** — *opt-in via `--install-packages`*. Installs the package list from `DEFAULT_PACKAGES` in `.env` (skip already-installed). Comment out packages you don't want.
+11. **Custom shell prompt** — *opt-in via `--prompt`*. Appends a guarded, idempotent colored PS1 block to `~/.bashrc` showing date/time, user@host, working directory, and (inside git repos) the current branch. The PS1 template is user-configurable via `PROMPT_PS1_TEMPLATE` in `.env`; leave blank to use the built-in default.
 
 The script is **idempotent** — re-running it won't break anything.
+
+> **v1.1.0 breaking change**: the `--install-defaults / -p` flag was renamed to `--install-packages / -i`. The `-p` short flag is now used by `--prompt`. Update any scripts or documentation that referenced the old flag.
 
 ---
 
@@ -80,8 +83,10 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `--no-apt-upgrade` | | Skip `apt update` + `apt upgrade` |
 | `--add-repo` | `-r` | Add 3rd-party repos from `APT_REPOSITORIES`, then `apt update` |
 | `--no-add-repo` | | Skip add-repo |
-| `--install-defaults` | `-p` | Install baseline packages from `DEFAULT_PACKAGES` |
-| `--no-install-defaults` | | Skip install-defaults |
+| `--install-packages` | `-i` | Install baseline packages from `DEFAULT_PACKAGES` |
+| `--no-install-packages` | | Skip install-packages |
+| `--prompt` | `-p` | Install managed colored PS1 block into `~/.bashrc` |
+| `--no-prompt` | | Skip prompt customization |
 
 ### Selection rules
 
@@ -109,6 +114,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `APT_AUTOREMOVE` | `true` = also run `apt-get autoremove -y` | `false` | no |
 | `APT_REPOSITORIES` | `name\|url[|suite|components|key_url];...` | none | no |
 | `DEFAULT_PACKAGES` | space-separated package list (comment with `#`) | rich default | no |
+| `PROMPT_ENABLED` | `true` = install managed PS1 block into `~/.bashrc` | `true` | yes (when running prompt section) |
+| `PROMPT_PS1_TEMPLATE` | custom PS1 string with ANSI escapes; blank = built-in default | blank | no |
 | `NONINTERACTIVE` | `true` = skip all prompts, fail on missing | `false` | — |
 
 > **Note on SSH key storage:** the preferred approach is to put your key in a separate file named `ssh_key.pub` in the same directory — no quoting headaches, and easy to `.gitignore`. The script uses `ssh_key.pub` if it exists, then falls back to `SSH_PUBLIC_KEY` in `.env`, then prompts.
@@ -236,6 +243,46 @@ When `FAIL2BAN_ENABLED=true` (default), the script:
 - Enables and starts/reloads the service
 
 If `/etc/fail2ban/jail.local` already exists and is **not** managed by this script (no marker comment), the script leaves it untouched — your existing config wins.
+
+## Custom shell prompt
+
+When `PROMPT_ENABLED=true` (default) **or** when `--prompt / -p` is passed, the script appends a managed, guarded PS1 block to `TARGET_USER`'s `~/.bashrc`.
+
+### Default prompt
+
+Renders as (inside a git repo):
+
+```
+26-09-24 19:09 web@host:~/projects/production-server-script (dev)$
+```
+
+Components left to right: gray date+time · green user@host · blue cwd · yellow git branch in parens · `$` (or `#` for root).
+
+Outside a git repo, the `(branch)` segment disappears cleanly — no stray `)`, no embedded newline.
+
+### Customizing the PS1
+
+Set `PROMPT_PS1_TEMPLATE` in `.env` to a PS1 string with ANSI escapes. The default template (uncomment to use as a starting point):
+
+```bash
+# Example: copy + edit this in .env
+# PROMPT_PS1_TEMPLATE='\[\033[1;90m\]\D{%y-%m-%d %H:%M}\[\033[0m\] \[\033[1;32m\]\u@\h\[\033[0m\]:\[\033[1;34m\]\w\[\033[0;33m\]$(b=$(git symbolic-ref --short HEAD 2>/dev/null); [[ -n "$b" ]] && printf " (%s)" "$b")\[\033[0m\]\$ '
+```
+
+**Tips:**
+
+- Wrap ANSI escape codes in `\[ \]` so bash counts them as zero-width (otherwise line wrapping breaks).
+- Use a **single** `\D{...}` call instead of multiple — each `\D{}` forks `date(1)`.
+- Wrap git branch subshells in `printf` (not `echo`) and gate with `[[ -n "$var" ]] && printf` — otherwise PS1 injects newlines or stray characters.
+- Use `git symbolic-ref --short HEAD` instead of `git branch` — the latter returns empty on repos with zero commits.
+
+### Re-running behavior
+
+The block is wrapped in `# >>> production-server-script:PROMPT >>>` / `# <<< production-server-script:PROMPT <<<` markers, so re-running `setup.sh` **replaces** the block in place instead of appending duplicates. Editing `PROMPT_PS1_TEMPLATE` and re-running picks up the new template.
+
+Inside the block, a `PROMPT_OVERRIDE` guard ensures PS1 is set **once per shell** — so if you source `~/.bashrc` again, the managed block won't override your own changes made during the session.
+
+To remove the block entirely, set `PROMPT_ENABLED=false` in `.env` and re-run.
 
 ## NONINTERACTIVE mode
 

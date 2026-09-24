@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Canonical section list — used by is_enabled auto-detect, Plan, Summary, and
 # NONINTERACTIVE preflight. Keep in sync with run_section calls at the bottom.
-SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults)
+SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults prompt)
 
 # ===========================================================================
 # CLI argument parsing
@@ -69,8 +69,10 @@ Sections (composable; default if no section flag given: run all):
       --no-apt-upgrade  Skip apt update + upgrade
   -r, --add-repo        Add 3rd-party APT repositories from .env, then apt update
       --no-add-repo     Skip add-repo
-  -p, --install-defaults Install baseline server packages from DEFAULT_PACKAGES
-      --no-install-defaults  Skip install-defaults
+  -i, --install-packages Install baseline server packages from DEFAULT_PACKAGES
+      --no-install-packages  Skip install-packages
+  -p, --prompt          Install managed colored PS1 block into ~/.bashrc
+      --no-prompt       Skip prompt customization
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
@@ -116,8 +118,10 @@ while (( $# > 0 )); do
     --no-apt-upgrade)      CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(apt-upgrade); shift ;;
     -r|--add-repo)         CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(add-repo); shift ;;
     --no-add-repo)         CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(add-repo); shift ;;
-    -p|--install-defaults) CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(install-defaults); shift ;;
-    --no-install-defaults) CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
+    -i|--install-packages) CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(install-defaults); shift ;;
+    --no-install-packages) CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
+    -p|--prompt)           CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(prompt); shift ;;
+    --no-prompt)           CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(prompt); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -131,7 +135,7 @@ done
 # (via CLI flag or .env-required-key presence). They never run on a bare
 # `sudo ./setup.sh` with no flags. Other sections default to enabled when
 # no flag is given, and to CLI_ENABLE_LIST when flags are given.
-OPT_IN_SECTIONS=(add-repo install-defaults)
+OPT_IN_SECTIONS=(add-repo install-defaults prompt)
 _section_is_opt_in() {
   local s="$1"
   for o in "${OPT_IN_SECTIONS[@]}"; do [[ "$o" == "$s" ]] && return 0; done
@@ -337,6 +341,7 @@ required_keys_for_section() {
     apt-upgrade) echo "APT_UPGRADE" ;;
     add-repo)    echo "APT_REPOSITORIES" ;;
     install-defaults) echo "DEFAULT_PACKAGES" ;;
+    prompt)      echo "PROMPT_ENABLED" ;;
   esac
 }
 
@@ -874,8 +879,12 @@ section_apt_upgrade() {
 # Section: install-defaults — install baseline server packages
 # Configured via DEFAULT_PACKAGES in .env (space-separated).
 # Users comment out or remove packages they don't want. Idempotent: skips
-# packages already installed. --install-defaults / -p (or DEFAULT_PACKAGES set
+# packages already installed. --install-packages / -i (or DEFAULT_PACKAGES set
 # in .env) is required to run this section.
+#
+# Note: the section is still called "install-defaults" internally for
+# backwards compatibility. The CLI flag was renamed from --install-defaults / -p
+# to --install-packages / -i in v1.1.0 because -p was reassigned to --prompt.
 # ===========================================================================
 section_install_defaults() {
   section "install baseline server packages"
@@ -921,6 +930,100 @@ section_install_defaults() {
 }
 
 # ===========================================================================
+# Section: prompt — install managed colored PS1 block into TARGET_USER's bashrc
+#
+# Writes a guarded, idempotent block to ~/.bashrc. The block only sets PS1
+# once per shell (PROMPT_OVERRIDE guard) and uses >>><<< markers so re-running
+# setup.sh replaces the block in place instead of appending duplicates.
+#
+# The PS1 string itself is either PROMPT_PS1_TEMPLATE from .env, or the
+# built-in default below. The default uses git symbolic-ref (works on repos
+# with zero commits) and a single \D{} call (1 fork per prompt instead of 3).
+# ===========================================================================
+section_bashrc() {
+  section "Install managed PS1 block into $TARGET_USER's .bashrc"
+
+  # Resolve target user + home (TARGET_USER/TARGET_HOME set earlier in script)
+  local bashrc="$TARGET_HOME/.bashrc"
+  local marker_start="# >>> production-server-script:PROMPT >>>"
+  local marker_end="# <<< production-server-script:PROMPT <<<"
+
+  # If the user explicitly disabled this section via .env, respect that even
+  # if they forgot to pass --no-prompt on the CLI.
+  if [[ "${ENV[PROMPT_ENABLED]:-}" =~ ^[Ff]alse$ ]]; then
+    info "PROMPT_ENABLED=false in .env — removing any existing block"
+    if [[ -f "$bashrc" ]] && grep -qF "$marker_start" "$bashrc"; then
+      # Strip the marker block + the trailing blank line if present
+      sed -i "/${marker_start}/,/${marker_end}/d" "$bashrc"
+      ok "Removed existing PS1 block from $bashrc"
+    else
+      info "No existing block to remove"
+    fi
+    return 0
+  fi
+
+  # Determine PS1 string: .env override OR built-in default
+  local ps1="${ENV[PROMPT_PS1_TEMPLATE]:-}"
+  if [[ -z "$ps1" ]]; then
+    ps1='\[\033[1;90m\]\D{%y-%m-%d %H:%M}\[\033[0m\] \[\033[1;32m\]\u@\h\[\033[0m\]:\[\033[1;34m\]\w\[\033[0;33m\]$(b=$(git symbolic-ref --short HEAD 2>/dev/null); [[ -n "$b" ]] && printf " (%s)" "$b")\[\033[0m\]\$ '
+    info "Using built-in default PS1 (set PROMPT_PS1_TEMPLATE in .env to override)"
+  else
+    info "Using PROMPT_PS1_TEMPLATE from .env"
+  fi
+
+  # Sanity-check: PS1 must contain at least one of \u, \h, or \$ to be useful
+  if [[ "$ps1" != *'\\u'* && "$ps1" != *'\\h'* && "$ps1" != *'\\$'* && "$ps1" != *'\$'* ]]; then
+    warn "PROMPT_PS1_TEMPLATE doesn't contain \\u, \\h, or \\$ — prompt will be empty. Skipping."
+    return 1
+  fi
+
+  # Build the block. Single-quote the heredoc so $ps1 is NOT expanded here
+  # — we want the literal PS1=... text in .bashrc, not the expanded version.
+  local block
+  block=$(cat <<EOF
+$marker_start
+if [[ -z "\${PROMPT_OVERRIDE:-}" ]]; then
+  export PROMPT_OVERRIDE=1
+  export PS1='$ps1'
+fi
+$marker_end
+EOF
+  )
+
+  # Make sure ~/.bashrc exists and is owned by TARGET_USER
+  if [[ ! -f "$bashrc" ]]; then
+    info "Creating $bashrc (did not exist)"
+    touch "$bashrc"
+  fi
+  chown "$TARGET_USER":"$TARGET_USER" "$bashrc" 2>/dev/null || true
+
+  # Idempotent: replace existing block in place, OR append
+  if grep -qF "$marker_start" "$bashrc"; then
+    # Use a python-free approach: extract lines NOT in the marker range,
+    # then append the new block. We use awk for portability (BSD/GNU both).
+    local tmpfile
+    tmpfile=$(mktemp)
+    awk -v start="$marker_start" -v end="$marker_end" \
+      '$0 == start { skip=1; next } $0 == end { skip=0; next } !skip { print }' \
+      "$bashrc" > "$tmpfile"
+    # Ensure file ends with a newline before we append
+    [[ -s "$tmpfile" && $(tail -c1 "$tmpfile" | wc -l) -eq 0 ]] && echo >> "$tmpfile"
+    printf '%s\n' "$block" >> "$tmpfile"
+    cat "$tmpfile" > "$bashrc"
+    rm -f "$tmpfile"
+    ok "Replaced existing PS1 block in $bashrc"
+  else
+    # Append, with a leading blank line for readability
+    [[ -s "$bashrc" && $(tail -c1 "$bashrc" | wc -l) -eq 0 ]] || echo >> "$bashrc"
+    printf '%s\n' "$block" >> "$bashrc"
+    ok "Appended PS1 block to $bashrc"
+  fi
+
+  chown "$TARGET_USER":"$TARGET_USER" "$bashrc" 2>/dev/null || true
+  ok "PS1 block installed for $TARGET_USER (login or 'source ~/.bashrc' to activate)"
+}
+
+# ===========================================================================
 # Dispatch — run only enabled sections
 # ===========================================================================
 SECTIONS_RUN=()
@@ -948,6 +1051,7 @@ run_section ssh-harden  section_ssh_harden
 run_section apt-upgrade section_apt_upgrade
 run_section add-repo    section_add_repo
 run_section install-defaults section_install_defaults
+run_section prompt      section_bashrc
 
 # ===========================================================================
 # Summary
@@ -985,6 +1089,13 @@ if is_enabled install-defaults; then
     dpkg -s "$p" >/dev/null 2>&1 && installed=$((installed+1))
   done
   ok "DEFAULT_PACKAGES:  $installed installed"
+fi
+if is_enabled prompt; then
+  if [[ -f "$TARGET_HOME/.bashrc" ]] && grep -qF 'production-server-script:PROMPT' "$TARGET_HOME/.bashrc"; then
+    ok "Prompt:       installed in $TARGET_HOME/.bashrc"
+  else
+    warn "Prompt:       enabled but block not found in $TARGET_HOME/.bashrc"
+  fi
 fi
 if (( ${#SECTIONS_FAILED[@]} > 0 )); then
   warn "Failed sections: ${SECTIONS_FAILED[*]}"
