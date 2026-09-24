@@ -552,13 +552,14 @@ section_ssh_key() {
   local key_file="${SCRIPT_DIR}/ssh_key.pub"
   local file_pubkey=""
   if [[ -f "$key_file" ]]; then
-    file_pubkey=$(awk '{$1=$1; print}' "$key_file")
+    file_pubkey=$(awk '{$1=$1; print}' "$key_file" | tr -d '\r')
     info "Loaded public key from $key_file"
   fi
 
   local env_pubkey="${ENV[SSH_PUBLIC_KEY]:-}"
   if [[ -z "$file_pubkey" ]] && [[ -n "$env_pubkey" ]]; then
-    file_pubkey="$env_pubkey"
+    # Strip CRLF in case the value came from a Windows-saved file or quoted paste
+    file_pubkey="${env_pubkey//$'\r'/}"
     info "Loaded public key from .env SSH_PUBLIC_KEY"
   fi
 
