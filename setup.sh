@@ -201,8 +201,6 @@ load_env_file() {
   done < "$file"
 }
 
-load_env_file "$ENV_FILE"
-
 # ===========================================================================
 # Helpers
 # ===========================================================================
@@ -211,6 +209,9 @@ ok()      { printf '  \033[1;32m[OK]\033[0m %s\n' "$1"; }
 info()    { printf '  [..] %s\n' "$1"; }
 warn()    { printf '  \033[1;33m[WARN]\033[0m %s\n' "$1"; }
 err()     { printf '  \033[1;31m[ERR]\033[0m %s\n' "$1"; }
+
+# Load .env AFTER helpers are defined (so load_env_file can use info)
+load_env_file "$ENV_FILE"
 
 MISSING_REQUIRED=()
 require_env() {
