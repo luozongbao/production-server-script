@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Canonical section list — used by is_enabled auto-detect, Plan, Summary, and
 # NONINTERACTIVE preflight. Keep in sync with run_section calls at the bottom.
-SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults prompt msmtp)
+SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults prompt msmtp server-report)
 
 # ===========================================================================
 # CLI argument parsing
@@ -75,6 +75,9 @@ Sections (composable; default if no section flag given: run all):
       --no-prompt       Skip prompt customization
   -m, --msmtp           Configure msmtp SMTP client (auto-detect or install)
       --no-msmtp        Skip msmtp configuration
+  -R, --server-report   Install luozongbao/server-report-script from a GitHub
+                        release zip (opt-in; see issues/011.md)
+      --no-server-report  Skip server-report install
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
@@ -126,6 +129,8 @@ while (( $# > 0 )); do
     --no-prompt)           CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(prompt); shift ;;
     -m|--msmtp)            CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(msmtp); shift ;;
     --no-msmtp)            CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(msmtp); shift ;;
+    -R|--server-report)    CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(server-report); shift ;;
+    --no-server-report)    CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(server-report); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -142,7 +147,7 @@ done
 # `msmtp` is intentionally NOT in OPT_IN_SECTIONS — it is part of RUN ALL
 # (sudo ./setup.sh with no flags), gated by --no-msmtp. Use --msmtp/-m in
 # selective runs. See issues/012.md for the design.
-OPT_IN_SECTIONS=(add-repo install-defaults prompt)
+OPT_IN_SECTIONS=(add-repo install-defaults prompt server-report)
 _section_is_opt_in() {
   local s="$1"
   for o in "${OPT_IN_SECTIONS[@]}"; do [[ "$o" == "$s" ]] && return 0; done
@@ -349,6 +354,7 @@ required_keys_for_section() {
     add-repo)    echo "APT_REPOSITORIES" ;;
     install-defaults) echo "DEFAULT_PACKAGES" ;;
     prompt)      echo "PROMPT_ENABLED" ;;
+    server-report) echo "SERVER_REPORT_SCIPT_LINK" ;;
     # msmtp has no required-key check: HOST/USER are required at section
     # time (inside section_msmtp), not at auto-detect time. Adding a key
     # here would just confuse the NONINTERACTIVE preflight, since the
@@ -1153,6 +1159,112 @@ MSMTPRC_EOF
 }
 
 # ===========================================================================
+# Section: server-report — pull and install luozongbao/server-report-script
+#
+# Opt-in section. Reads SERVER_REPORT_SCIPT_LINK from .env — the full URL
+# to a GitHub release zip (e.g. https://github.com/.../archive/refs/tags/v.2.0.zip).
+# Default points at the latest upstream tag at install time.
+#
+# What the section does:
+#   1. curl -fsSL the zip into a tempdir
+#   2. unzip into /opt/server-report-script/
+#   3. run the upstream install.sh (sudo install.sh) which handles the
+#      actual placement: scripts -> /usr/local/bin/{auth,attack,memory}-report.sh,
+#      lib/ -> /usr/local/share/server-report-script/lib/, and seeds
+#      /etc/server-report-script.env (mode 0600) from .env.example.
+#
+# We do NOT symlink /usr/local/bin ourselves (install.sh owns those paths).
+# We do NOT verify checksums (upstream does not publish .sha256 files).
+# We do NOT prompt for a version — the .env key IS the link.
+#
+# NO GitHub API call, NO git clone — works on hosts that can reach
+# github.com but NOT api.github.com (common on China-region networks).
+#
+# Idempotent: install.sh is idempotent by design (safe to re-run).
+# ===========================================================================
+section_server_report() {
+  section "Install luozongbao/server-report-script"
+
+  local install_dir="/opt/server-report-script"
+  local url="${ENV[SERVER_REPORT_SCIPT_LINK]:-https://github.com/luozongbao/server-report-script/archive/refs/tags/v.2.0.zip}"
+
+  # Defense in depth: only allow https URLs to github.com. A malformed .env
+  # value (http://, file://, custom scheme) is a configuration error — exit
+  # non-zero before any curl touches disk.
+  if [[ ! "$url" =~ ^https://github\.com/ ]]; then
+    err "Invalid SERVER_REPORT_SCIPT_LINK: '$url'"
+    err "Expected an https://github.com/... release-zip URL"
+    return 1
+  fi
+
+  local tmpdir archive
+  tmpdir=$(mktemp -d) || { err "mktemp failed"; return 1; }
+  archive="$tmpdir/server-report.zip"
+
+  info "Downloading $url"
+  if ! curl -fsSL -o "$archive" "$url"; then
+    err "Download failed: $url"
+    err "Check the URL is reachable and points at a valid release asset"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  local size; size=$(stat -c '%s' "$archive" 2>/dev/null || echo 0)
+  ok "Downloaded $size bytes"
+
+  # Re-create /opt/server-report-script/ from the zip. We remove the dir and
+  # recreate it so perms / ownership on a re-install are predictable; any
+  # symlink at /usr/local/bin/server-report pointing into this tree is left
+  # untouched (it just dangles until install.sh below rewrites the real path).
+  mkdir -p "$install_dir"
+  find "$install_dir" -mindepth 1 -delete 2>/dev/null || true
+  if ! unzip -q "$archive" -d "$tmpdir"; then
+    err "unzip failed — archive may be corrupt"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  # GitHub zips produce a single top-level dir named after the repo + tag.
+  # Bail with a clear error if the layout is unexpected.
+  local extracted_top
+  extracted_top=$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | head -n1)
+  if [[ -z "$extracted_top" ]] || [[ ! -d "$extracted_top" ]]; then
+    err "Unexpected zip layout — no top-level directory found in archive"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  shopt -s dotglob
+  if ! cp -a "$extracted_top"/. "$install_dir"/; then
+    shopt -u dotglob
+    err "Failed to copy extracted files into $install_dir"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  shopt -u dotglob
+  rm -rf "$tmpdir"
+  ok "Installed to $install_dir"
+
+  # Hand off to the upstream installer. install.sh is itself idempotent and
+  # places scripts at /usr/local/bin/{auth,attack,memory}-report.sh (0755),
+  # lib/ at /usr/local/share/server-report-script/lib/ (0644), and seeds
+  # /etc/server-report-script.env (0600) from .env.example. We do NOT need
+  # to create any symlinks ourselves.
+  if [[ -x "$install_dir/install.sh" ]]; then
+    info "Running upstream installer (sudo $install_dir/install.sh)"
+    if sudo "$install_dir/install.sh"; then
+      ok "Upstream installer finished"
+    else
+      err "Upstream install.sh exited non-zero — install may be incomplete"
+      err "Re-run later with: sudo $install_dir/install.sh"
+      return 1
+    fi
+  else
+    err "Expected $install_dir/install.sh to exist and be executable"
+    return 1
+  fi
+}
+
+# ===========================================================================
 # Dispatch — run only enabled sections
 # ===========================================================================
 SECTIONS_RUN=()
@@ -1182,6 +1294,7 @@ run_section add-repo    section_add_repo
 run_section install-defaults section_install_defaults
 run_section prompt      section_bashrc
 run_section msmtp       section_msmtp
+run_section server-report section_server_report
 
 # ===========================================================================
 # Summary
@@ -1233,6 +1346,13 @@ if is_enabled msmtp; then
     ok "msmtp:        installed, $TARGET_HOME/.msmtprc (mode $rc_status)"
   else
     warn "msmtp:        enabled but binary not found"
+  fi
+fi
+if is_enabled server-report; then
+  if [[ -x /usr/local/bin/auth-report.sh && -x /usr/local/bin/attack-report.sh && -x /usr/local/bin/memory-report.sh ]]; then
+    ok "server-report: scripts installed to /usr/local/bin/{auth,attack,memory}-report.sh"
+  else
+    warn "server-report: enabled but one or more scripts missing from /usr/local/bin/"
   fi
 fi
 if (( ${#SECTIONS_FAILED[@]} > 0 )); then

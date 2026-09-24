@@ -14,6 +14,7 @@ A single Bash script that brings a fresh Ubuntu/Debian server to a sane producti
 10. **Install baseline server packages** — *opt-in via `--install-packages`*. Installs the package list from `DEFAULT_PACKAGES` in `.env` (skip already-installed). Comment out packages you don't want.
 11. **Custom shell prompt** — *opt-in via `--prompt`*. Appends a guarded, idempotent colored PS1 block to `~/.bashrc` showing date/time, user@host, working directory, and (inside git repos) the current branch. The PS1 template is user-configurable via `PROMPT_PS1_TEMPLATE` in `.env`; leave blank to use the built-in default.
 12. **msmtp SMTP client** — runs in **RUN ALL** by default (skip with `--no-msmtp`; run in selective mode with `--msmtp / -m`). Installs `msmtp`/`msmtp-mta` via apt if missing, prompts for the SMTP password interactively, then writes a per-user `~/.msmtprc` (mode 0600) from the `MSMTP_*` values in `.env`.
+13. **`luozongbao/server-report-script`** — *opt-in via `--server-report`*. Downloads the GitHub release zip at `SERVER_REPORT_SCIPT_LINK`, extracts to `/opt/server-report-script/`, then runs the upstream `sudo install.sh` (which handles `/usr/local/bin/{auth,attack,memory}-report.sh` placement, `lib/` under `/usr/local/share/`, and `/etc/server-report-script.env` seeding). No GitHub API call — works on hosts that can reach `github.com` but not `api.github.com`.
 
 The script is **idempotent** — re-running it won't break anything.
 
@@ -95,6 +96,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `--no-prompt` | | Skip prompt customization |
 | `--msmtp` | `-m` | Configure msmtp SMTP client (install if missing, write `~/.msmtprc`). Runs in RUN ALL by default; this flag is for selective invocations. |
 | `--no-msmtp` | | Skip msmtp configuration (override the RUN ALL default) |
+| `--server-report` | `-R` | Pull + install `luozongbao/server-report-script` from a GitHub release zip. Opt-in. | `-r` is taken by `--add-repo`. |
+| `--no-server-report` | | Skip server-report install |
 
 ### Selection rules
 
@@ -106,7 +109,7 @@ This is what you run on a fresh server. Every **default** section runs in order,
 
 | Runs unconditionally | Runs only if its required `.env` key is set |
 |---|---|
-| timezone, hostname, firewall, ssh-key, swap, fail2ban, ssh-harden, apt-upgrade, msmtp | add-repo (`APT_REPOSITORIES`), install-defaults (`DEFAULT_PACKAGES`), prompt (`PROMPT_ENABLED`) |
+| timezone, hostname, firewall, ssh-key, swap, fail2ban, ssh-harden, apt-upgrade, msmtp | add-repo (`APT_REPOSITORIES`), install-defaults (`DEFAULT_PACKAGES`), prompt (`PROMPT_ENABLED`), server-report (`SERVER_REPORT_SCIPT_LINK`) |
 
 You can subtract any default section without leaving RUN ALL mode by adding `--no-<taskname>`. For example `sudo ./setup.sh --no-msmtp` runs everything except msmtp; `sudo ./setup.sh --no-msmtp --no-prompt` runs everything except msmtp and the prompt block. `--no-X` flags on sections that aren't even running are harmless.
 
@@ -155,6 +158,7 @@ Passing `--no-<section>` without its positive counterpart is allowed and behaves
 | `DEFAULT_PACKAGES` | space-separated package list (comment with `#`) | rich default | no |
 | `PROMPT_ENABLED` | `true` = install managed PS1 block into `~/.bashrc` | `true` | yes (when running prompt section) |
 | `PROMPT_PS1_TEMPLATE` | custom PS1 string with ANSI escapes; blank = built-in default | blank | no |
+| `SERVER_REPORT_SCIPT_LINK` | full URL to a GitHub release zip (https://github.com/...) — `setup.sh` downloads + extracts to `/opt/server-report-script/` then runs `sudo install.sh` (the upstream installer handles `/usr/local/bin/` placement) | default URL pinned to upstream's `v.2.0` tag | yes (when running server-report section) |
 | `MSMTP_HOST` | SMTP server hostname | blank | yes (when running msmtp section) |
 | `MSMTP_PORT` | SMTP port (typically `587` for STARTTLS, `465` for SMTPS) | `587` | no |
 | `MSMTP_USER` | SMTP auth username | blank | yes (when running msmtp section) |
@@ -434,6 +438,108 @@ If you need to provision the server without a human at the terminal, the section
 The section overwrites `~/.msmtprc` on every run with the current `.env` values + the password you typed, so rotating the SMTP password with your provider and re-running `setup.sh` picks up the new credential with no manual edit.
 
 If `apt-get install msmtp` fails (e.g. no network to the Debian mirror), the section aborts before touching any config files, so a half-installed state cannot happen.
+
+## `luozongbao/server-report-script` installer
+
+A companion utility the maintainer also runs on every server to collect
+diagnostics and report them. `setup.sh` ships an **opt-in** section that pulls
+the upstream release zip, extracts it to `/opt/server-report-script/`, then
+runs **the upstream `install.sh`** which handles all the placement work
+itself (scripts at `/usr/local/bin/`, `lib/` under
+`/usr/local/share/`, seeded `/etc/server-report-script.env`). See
+[luozongbao/server-report-script](https://github.com/luozongbao/server-report-script).
+
+This section is **opt-in** — it never runs on a bare `sudo ./setup.sh`. Either
+pass `--server-report / -R`, or set `SERVER_REPORT_SCIPT_LINK` in `.env` and
+the section auto-enables in RUN ALL mode.
+
+> **Spelling note** — the env key is `SERVER_REPORT_SCIPT_LINK` (with the "R"
+> missing from "SCRIPT"). That name was chosen during the implementation of
+> issue #011 and is preserved here verbatim. Rename freely in your own `.env`
+> if you maintain this config long-term.
+
+### Trigger model
+
+| Invocation | `server-report` runs? |
+|---|---|
+| `sudo ./setup.sh` (RUN ALL, no flags) with `SERVER_REPORT_SCIPT_LINK` set in `.env` | yes |
+| `sudo ./setup.sh` with `SERVER_REPORT_SCIPT_LINK` blank | **no** — section skipped silently |
+| `sudo ./setup.sh --server-report` / `-R` | yes |
+| `sudo ./setup.sh --no-server-report` | no |
+| `sudo ./setup.sh --server-report --non-interactive` with `SERVER_REPORT_SCIPT_LINK` blank | **no** — fails fast with exit 2 |
+
+### What the section does
+
+1. **Downloads** the GitHub release zip from the **literal URL** you put in `SERVER_REPORT_SCIPT_LINK` (default: `https://github.com/luozongbao/server-report-script/archive/refs/tags/v.2.0.zip`). No `git clone`, no GitHub API call — this works on hosts that can reach `github.com` but NOT `api.github.com` (common on China-region networks).
+2. **Extracts** to `/opt/server-report-script/`. Re-runs overwrite the directory in place; the directory itself is preserved so its owner / perms don't churn.
+3. **Hands off to the upstream installer** — runs `sudo /opt/server-report-script/install.sh`. That installer is idempotent (safe to re-run) and produces:
+   - `/usr/local/bin/{auth,attack,memory}-report.sh` — `0755`
+   - `/usr/local/share/server-report-script/lib/` — `0644`
+   - `/etc/server-report-script.env` — `0600` (seeded from `.env.example` only if missing; pass `sudo /opt/server-report-script/install.sh --force` to overwrite)
+4. **`setup.sh` does NOT symlink anything into `/usr/local/bin/` itself** — that's the upstream installer's job, and the resulting file mode `0755` install is what the upstream recipes expect (each script resolves its `lib/common.sh` lookup through a 4-tier chain that includes `/usr/local/share/...`).
+
+### `.env` keys
+
+```bash
+# Full URL to a GitHub release zip. The section does NOT construct this
+# for you — whatever you put here is exactly what gets downloaded. Pick
+# a tag from https://github.com/luozongbao/server-report-script/tags.
+SERVER_REPORT_SCIPT_LINK=https://github.com/luozongbao/server-report-script/archive/refs/tags/v.2.0.zip
+```
+
+The default in `.env.example` points at upstream's `v.2.0` tag. To pin to a
+newer or older release, paste a different zip URL (right-click → "Copy link
+address" on the **Source code (zip)** asset in the GitHub releases UI).
+
+> **URL scheme guard** — only `https://github.com/...` is accepted. A
+> malformed `.env` value (e.g. `http://`, `file://`, a custom scheme, or a
+> non-GitHub host) exits non-zero with a clear "Invalid
+> `SERVER_REPORT_SCIPT_LINK`" message **before** any `curl` call — the
+> section never downloads from an arbitrary host.
+
+### Re-running behavior
+
+The section is fully idempotent:
+
+- `/opt/server-report-script/` is emptied in place (the directory itself is
+  preserved so its owner / perms don't change) and re-populated from the
+  latest extracted zip contents.
+- The upstream `install.sh` is itself idempotent — re-running it does not
+  duplicate or damage the `/usr/local/bin/`, `/usr/local/share/`, or
+  `/etc/server-report-script.env` placements. To force-overwrite an existing
+  `/etc/server-report-script.env` after you edited it manually, run
+  `sudo /opt/server-report-script/install.sh --force`.
+
+### Failure modes
+
+- **Bad URL** (e.g. 404, or a `SERVER_REPORT_SCIPT_LINK` that's not an
+  `https://github.com/...` URL) → `curl` fails, the section prints the URL
+  and a hint to verify it, then `rm -rf $tmpdir` and exits non-zero. **No
+  partial install** — `/opt/server-report-script/` is not touched unless
+  the download succeeds.
+- **Upstream `install.sh` exits non-zero** → the section warns and exits
+  non-zero with the exact `sudo` re-run command to finish manually. The
+  `/opt/server-report-script/` checkout is already on disk, so the manual
+  re-run is a one-liner.
+- **Missing `SERVER_REPORT_SCIPT_LINK` in `NONINTERACTIVE` mode** →
+  `exit 2` with a clear message. No interactive prompt for the URL in
+  unattended runs (it's a deploy-time decision).
+
+### Network-restriction compatibility
+
+The section downloads from `https://github.com/...` — the same origin your
+browser would hit — and never touches `api.github.com`. To verify it works
+on a host where the API is blocked:
+
+```bash
+# This MUST work for the section to work:
+curl -fsSL -o /dev/null "$(awk -F= '/^SERVER_REPORT_SCIPT_LINK=/ {print $2}' .env)"
+
+# This is NOT contacted:
+curl -fsSL -o /dev/null https://api.github.com/repos/luozongbao/server-report-script/releases
+```
+
+---
 
 ## NONINTERACTIVE mode
 
