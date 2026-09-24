@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Canonical section list — used by is_enabled auto-detect, Plan, Summary, and
 # NONINTERACTIVE preflight. Keep in sync with run_section calls at the bottom.
-SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults prompt)
+SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults prompt msmtp)
 
 # ===========================================================================
 # CLI argument parsing
@@ -73,6 +73,8 @@ Sections (composable; default if no section flag given: run all):
       --no-install-packages  Skip install-packages
   -p, --prompt          Install managed colored PS1 block into ~/.bashrc
       --no-prompt       Skip prompt customization
+  -m, --msmtp           Configure msmtp SMTP client (auto-detect or install)
+      --no-msmtp        Skip msmtp configuration
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
@@ -122,6 +124,8 @@ while (( $# > 0 )); do
     --no-install-packages) CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
     -p|--prompt)           CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(prompt); shift ;;
     --no-prompt)           CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(prompt); shift ;;
+    -m|--msmtp)            CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(msmtp); shift ;;
+    --no-msmtp)            CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(msmtp); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -135,7 +139,7 @@ done
 # (via CLI flag or .env-required-key presence). They never run on a bare
 # `sudo ./setup.sh` with no flags. Other sections default to enabled when
 # no flag is given, and to CLI_ENABLE_LIST when flags are given.
-OPT_IN_SECTIONS=(add-repo install-defaults prompt)
+OPT_IN_SECTIONS=(add-repo install-defaults prompt msmtp)
 _section_is_opt_in() {
   local s="$1"
   for o in "${OPT_IN_SECTIONS[@]}"; do [[ "$o" == "$s" ]] && return 0; done
@@ -342,6 +346,7 @@ required_keys_for_section() {
     add-repo)    echo "APT_REPOSITORIES" ;;
     install-defaults) echo "DEFAULT_PACKAGES" ;;
     prompt)      echo "PROMPT_ENABLED" ;;
+    msmtp)       echo "MSMTP_ENABLED" ;;
   esac
 }
 
@@ -1024,6 +1029,171 @@ EOF
 }
 
 # ===========================================================================
+# Section: msmtp — configure msmtp SMTP client (~/.msmtprc)
+#
+# Auto-detects whether msmtp is installed. If MSMTP_ENABLED=true and msmtp is
+# missing, installs it via apt. Writes a managed ~/.msmtprc for TARGET_USER
+# with mode 0600 (msmtp refuses to run with looser permissions). Optionally
+# also writes /root/.msmtprc for system cron jobs, and optionally sends a
+# test email to verify the config works end-to-end.
+#
+# All .env values are required when NONINTERACTIVE=true. When interactive,
+# missing values are prompted (password is read silently).
+# ===========================================================================
+section_msmtp() {
+  section "msmtp SMTP client configuration"
+
+  # Step 0: explicit opt-in gate. Without MSMTP_ENABLED=true this section
+  # is a no-op, even if msmtp happens to be installed on the system. This
+  # prevents the script from hanging on interactive prompts when users
+  # haven't asked for msmtp configuration.
+  if ! [[ "${ENV[MSMTP_ENABLED]:-}" =~ ^[Tt]rue$ ]]; then
+    info "MSMTP_ENABLED not true — skipping msmtp configuration"
+    return 0
+  fi
+
+  # Step 1: optionally install msmtp if requested and missing
+  if ! command -v msmtp >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      warn "apt-get not found — cannot install msmtp automatically"
+    else
+      info "msmtp not installed — installing via apt"
+      export DEBIAN_FRONTEND=noninteractive
+      if ! apt-get install -y -qq msmtp msmtp-mta; then
+        err "apt-get install msmtp failed — check apt output above"
+        return 1
+      fi
+      ok "msmtp installed"
+    fi
+  fi
+
+  # Step 2: bail if msmtp still not available (and not requested to install)
+  if ! command -v msmtp >/dev/null 2>&1; then
+    info "msmtp not present and apt install failed — skipping"
+    return 0
+  fi
+
+  # Step 3: collect SMTP settings (host/port/user/from are non-secret, so we
+  # accept them via .env OR interactive prompt; the password is NEVER read
+  # from .env — see Step 3b).
+  local host="${ENV[MSMTP_HOST]:-}"
+  local port="${ENV[MSMTP_PORT]:-587}"
+  local user="${ENV[MSMTP_USER]:-}"
+  local from="${ENV[MSMTP_FROM]:-}"
+
+  if [[ -z "$host" || -z "$user" ]]; then
+    if [[ "$NONINTERACTIVE" == "true" ]]; then
+      err "MSMTP_HOST and MSMTP_USER are required when NONINTERACTIVE=true"
+      return 1
+    fi
+    [[ -z "$host" ]] && { read -r -p "  SMTP host: " host; }
+    [[ -z "$port" ]] && { read -r -p "  SMTP port [587]: " port; port="${port:-587}"; }
+    [[ -z "$user" ]] && { read -r -p "  SMTP user: " user; }
+    [[ -z "$from" ]] && { read -r -p "  From address [$user]: " from; from="${from:-$user}"; }
+  fi
+  [[ -z "$from" ]] && from="$user"
+  [[ -z "$port" ]] && port="587"
+
+  # Step 3b: collect the SMTP password.
+  # The password is NEVER read from .env (no MSMTP_PASSWORD key by design).
+  # Two paths:
+  #   1. Interactive (default): prompt silently, then prompt again to confirm.
+  #      Mismatch → re-prompt. Loop until match or user aborts (Ctrl-C / EOF).
+  #   2. Non-interactive: MSMTP_PASSWORD_FILE points to a single-line file
+  #      containing the password. The file should be mode 0400 or 0600, NOT
+  #      inside the repo, and the password is consumed once (variable is
+  #      unset as soon as the .msmtprc is written).
+  local pass=""
+  if [[ -n "${ENV[MSMTP_PASSWORD_FILE]:-}" ]]; then
+    local pwfile="${ENV[MSMTP_PASSWORD_FILE]}"
+    if [[ ! -r "$pwfile" ]]; then
+      err "MSMTP_PASSWORD_FILE=$pwfile is not readable"
+      return 1
+    fi
+    # Read the first non-empty, non-comment line. Supports files where the
+    # user has put `# comment` or blank lines around the secret. Strip
+    # trailing CR (in case the file was edited on Windows).
+    pass=$(awk 'NF && !/^[[:space:]]*#/ {print; exit}' "$pwfile" | tr -d '\r')
+    [[ -z "$pass" ]] && { err "MSMTP_PASSWORD_FILE=$pwfile contains no usable password (only blanks/comments?)"; return 1; }
+  elif [[ "$NONINTERACTIVE" == "true" ]]; then
+    err "MSMTP password is required: set MSMTP_PASSWORD_FILE or run interactively"
+    return 1
+  else
+    # Interactive: prompt + confirm loop. No echo on terminal.
+    while :; do
+      local pass1 pass2
+      read -r -s -p "  SMTP password: " pass1; echo
+      [[ -z "$pass1" ]] && { warn "password cannot be empty"; continue; }
+      read -r -s -p "  Confirm password: " pass2; echo
+      if [[ "$pass1" != "$pass2" ]]; then
+        warn "passwords do not match — try again (Ctrl-C to abort)"
+        continue
+      fi
+      pass="$pass1"
+      unset pass1 pass2
+      break
+    done
+  fi
+  # Belt + suspenders: never let the password linger in this function's
+  # scope after the config file is written.
+  trap 'unset pass' RETURN
+
+  # Step 4: write ~/.msmtprc (per-user)
+  local rcfile="$TARGET_HOME/.msmtprc"
+  # Ensure parent dir exists with correct ownership
+  mkdir -p "$(dirname "$rcfile")"
+
+  # Use a here-doc with no variable expansion for the static part, then
+  # printf the variable values directly — keeps the password from being
+  # accidentally mangled by globbing or word-splitting in the heredoc body.
+  cat > "$rcfile" <<'MSMTPRC_EOF'
+# Managed by production-server-script — do not edit by hand.
+# To update, edit MSMTP_* values in .env and re-run setup.sh.
+defaults
+auth           on
+tls            on
+tls_starttls   on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        ~/.msmtp.log
+
+account        default
+MSMTPRC_EOF
+  # Append the variable fields. Use printf with %s quoting to avoid
+  # interpretation of %, \, and special characters in passwords.
+  {
+    printf 'host           %s\n' "$host"
+    printf 'port           %s\n' "$port"
+    printf 'from           %s\n' "$from"
+    printf 'user           %s\n' "$user"
+    printf 'password       %s\n' "$pass"
+  } >> "$rcfile"
+
+  chown "$TARGET_USER":"$TARGET_USER" "$rcfile"
+  chmod 600 "$rcfile"
+  ok "Wrote $rcfile (mode 600, owner $TARGET_USER)"
+
+  # Step 5: optionally also configure /root/.msmtprc for system cron
+  if [[ "${ENV[MSMTP_ROOT_CONFIG]:-}" =~ ^[Tt]rue$ ]]; then
+    install -m 0600 -o root -g root "$rcfile" /root/.msmtprc
+    ok "Wrote /root/.msmtprc (mode 600, owner root)"
+  fi
+
+  # Step 6: optional smoke test
+  local test_to="${ENV[MSMTP_TEST_EMAIL_TO]:-}"
+  if [[ "$test_to" =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]]; then
+    info "Sending test email to $test_to"
+    local body
+    body=$(printf 'From: %s\nTo: %s\nSubject: setup.sh msmtp test\n\nTest from %s at %s.\n' \
+      "$from" "$test_to" "$(hostname)" "$(date)")
+    if printf '%s' "$body" | msmtp --file="$rcfile" "$test_to" >/dev/null 2>&1; then
+      ok "Test email sent to $test_to"
+    else
+      warn "Test email send failed — check $rcfile and ~/.msmtp.log"
+    fi
+  fi
+}
+
+# ===========================================================================
 # Dispatch — run only enabled sections
 # ===========================================================================
 SECTIONS_RUN=()
@@ -1052,6 +1222,7 @@ run_section apt-upgrade section_apt_upgrade
 run_section add-repo    section_add_repo
 run_section install-defaults section_install_defaults
 run_section prompt      section_bashrc
+run_section msmtp       section_msmtp
 
 # ===========================================================================
 # Summary
@@ -1095,6 +1266,14 @@ if is_enabled prompt; then
     ok "Prompt:       installed in $TARGET_HOME/.bashrc"
   else
     warn "Prompt:       enabled but block not found in $TARGET_HOME/.bashrc"
+  fi
+fi
+if is_enabled msmtp; then
+  if command -v msmtp >/dev/null 2>&1; then
+    rc_status="$([ -f "$TARGET_HOME/.msmtprc" ] && stat -c '%a' "$TARGET_HOME/.msmtprc" 2>/dev/null || echo missing)"
+    ok "msmtp:        installed, $TARGET_HOME/.msmtprc (mode $rc_status)"
+  else
+    warn "msmtp:        enabled but binary not found"
   fi
 fi
 if (( ${#SECTIONS_FAILED[@]} > 0 )); then
