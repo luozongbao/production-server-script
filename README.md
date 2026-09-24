@@ -10,6 +10,7 @@ A single Bash script that brings a fresh Ubuntu/Debian server to a sane producti
 6. **fail2ban** — install and enable the SSH jail with configurable bantime/findtime/maxretry
 7. **SSH hardening** — *advisory only*; prints recommended `sshd_config` and the manual commands to apply them safely
 8. **apt update + upgrade** — runs `apt-get update && apt-get upgrade` (and optional `autoremove`) to bring the system up to date
+9. **Add 3rd-party APT repositories** — *opt-in via `--add-repo`*. Adds repositories from `APT_REPOSITORIES`, then runs `apt update`. Does **not** run upgrade.
 
 The script is **idempotent** — re-running it won't break anything.
 
@@ -76,6 +77,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `--help` | `-h` | Show usage |
 | `--apt-upgrade` | `-u` | Run `apt update` + `apt upgrade` |
 | `--no-apt-upgrade` | | Skip `apt update` + `apt upgrade` |
+| `--add-repo` | `-r` | Add 3rd-party repos from `APT_REPOSITORIES`, then `apt update` |
+| `--no-add-repo` | | Skip add-repo |
 
 ### Selection rules
 

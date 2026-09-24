@@ -43,6 +43,7 @@ FLAG_SWAP=""
 FLAG_FAIL2BAN=""
 FLAG_SSH_HARDEN=""
 FLAG_APT_UPGRADE=""
+FLAG_ADD_REPO=""
 FLAG_NONINTERACTIVE="false"
 CLI_FLAG_GIVEN=false
 CLI_ENABLE_LIST=()   # section names explicitly enabled via CLI
@@ -69,6 +70,8 @@ Sections (composable; default if no section flag given: run all):
       --no-ssh-harden   Skip SSH hardening advisory
   -u, --apt-upgrade     Run apt update + upgrade (and optionally autoremove)
       --no-apt-upgrade  Skip apt update + upgrade
+  -r, --add-repo        Add 3rd-party APT repositories from .env, then apt update
+      --no-add-repo     Skip add-repo
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
@@ -112,6 +115,8 @@ while (( $# > 0 )); do
     --no-ssh-harden)       FLAG_SSH_HARDEN=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(ssh-harden); shift ;;
     -u|--apt-upgrade)      FLAG_APT_UPGRADE=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(apt-upgrade); shift ;;
     --no-apt-upgrade)      FLAG_APT_UPGRADE=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(apt-upgrade); shift ;;
+    -r|--add-repo)         FLAG_ADD_REPO=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(add-repo); shift ;;
+    --no-add-repo)         FLAG_ADD_REPO=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(add-repo); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -121,16 +126,32 @@ while (( $# > 0 )); do
 done
 
 # Resolve final section-enabled state.
-# Rule: if no section flags were given → all enabled.
-# Otherwise: enabled = explicitly_enabled + (not in disable list, for sections
-# that have an --enable form). To keep semantics simple, we require the user
-# to enable via CLI_ENABLE_LIST and respect CLI_DISABLE_LIST. Anything not
-# listed is DISABLED when CLI_FLAG_GIVEN=true.
+# Sections listed in OPT_IN_SECTIONS only run when explicitly requested
+# (via CLI flag or .env-required-key presence). They never run on a bare
+# `sudo ./setup.sh` with no flags. Other sections default to enabled when
+# no flag is given, and to CLI_ENABLE_LIST when flags are given.
+OPT_IN_SECTIONS=(add-repo)
+_section_is_opt_in() {
+  local s="$1"
+  for o in "${OPT_IN_SECTIONS[@]}"; do [[ "$o" == "$s" ]] && return 0; done
+  return 1
+}
+
 is_enabled() {
   local s="$1"
   for d in "${CLI_DISABLE_LIST[@]:-}"; do [[ "$d" == "$s" ]] && return 1; done
   if [[ "$CLI_FLAG_GIVEN" == "true" ]]; then
     for e in "${CLI_ENABLE_LIST[@]:-}"; do [[ "$e" == "$s" ]] && return 0; done
+    return 1
+  fi
+  # No CLI flag: opt-in sections stay disabled unless required .env keys exist
+  if _section_is_opt_in "$s"; then
+    # Auto-enable opt-in section if its required .env key is set
+    local rk
+    rk=$(required_keys_for_section "$s")
+    if [[ -n "$rk" ]] && [[ -n "${ENV[$rk]:-}" ]]; then
+      return 0
+    fi
     return 1
   fi
   return 0
@@ -315,6 +336,7 @@ required_keys_for_section() {
     fail2ban)  echo "FAIL2BAN_ENABLED" ;;
     ssh-harden) echo "" ;;  # no required key
     apt-upgrade) echo "APT_UPGRADE" ;;
+    add-repo)    echo "APT_REPOSITORIES" ;;
   esac
 }
 
@@ -322,7 +344,7 @@ if [[ "$NONINTERACTIVE" == "false" ]]; then
   # Check if all required keys for enabled sections are present in .env
   auto_ok=true
   auto_missing=()
-  for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade; do
+  for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo; do
     is_enabled "$sec" || continue
     rk=$(required_keys_for_section "$sec")
     [[ -z "$rk" ]] && continue
@@ -402,7 +424,7 @@ fi
 # Show plan
 # ===========================================================================
 section "Plan"
-info "Sections enabled: $(for s in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade; do is_enabled "$s" && printf '%s ' "$s"; done)"
+info "Sections enabled: $(for s in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo; do is_enabled "$s" && printf '%s ' "$s"; done)"
 info "Mode: $([[ "$NONINTERACTIVE" == "true" ]] && echo non-interactive || echo interactive)"
 [[ -f "$ENV_FILE" ]] && info "Config: $ENV_FILE"
 echo
@@ -710,6 +732,97 @@ EOF
 }
 
 # ===========================================================================
+# Section: add-repo — add 3rd-party APT repositories, then apt update
+# Configured via APT_REPOSITORIES in .env:
+#   APT_REPOSITORIES="name1|url1|suite1|component1|key_url1;name2|url2|..."
+# Or a simpler key=value list:
+#   APT_REPOSITORIES="docker|https://download.docker.com/linux/ubuntu"
+# When the flag is passed, only this section runs (default behavior of section
+# registry) — it does NOT trigger apt-upgrade.
+# ===========================================================================
+section_add_repo() {
+  section "add 3rd-party APT repositories"
+  if ! command -v apt-get >/dev/null 2>&1; then
+    warn "apt-get not found — skipping (this script targets Debian/Ubuntu)"
+    return 0
+  fi
+
+  local raw="${ENV[APT_REPOSITORIES]:-}"
+  if [[ -z "$raw" ]] && [[ "$NONINTERACTIVE" != "true" ]]; then
+    read -r -p "  Enter APT_REPOSITORIES (blank to skip): " raw
+  fi
+  if [[ -z "$raw" ]]; then
+    info "No APT_REPOSITORIES configured — skipping"
+    return 0
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    apt-get install -y -qq curl ca-certificates
+  fi
+
+  local added=0 skipped=0
+  IFS=';' read -ra repos <<< "$raw"
+  for entry in "${repos[@]}"; do
+    entry="${entry## }"; entry="${entry%% }"
+    [[ -z "$entry" ]] && continue
+
+    # Format A: name|url|suite|components|key_url
+    # Format B: name|url  (suite/components/key are auto/optional)
+    IFS='|' read -ra parts <<< "$entry"
+    local name="${parts[0]:-}"
+    local url="${parts[1]:-}"
+    local suite="${parts[2]:-}"
+    local comps="${parts[3]:-}"
+    local key_url="${parts[4]:-}"
+
+    if [[ -z "$name" || -z "$url" ]]; then
+      warn "Skipping malformed entry: $entry"
+      skipped=$((skipped+1))
+      continue
+    fi
+
+    local list_file="/etc/apt/sources.list.d/${name}.list"
+    if [[ -f "$list_file" ]]; then
+      info "$list_file already exists — skipping"
+      skipped=$((skipped+1))
+      continue
+    fi
+
+    # Auto-fill suite + components if not given
+    if [[ -z "$suite" ]]; then
+      suite="$(. /etc/os-release 2>/dev/null && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")"
+      [[ -z "$suite" ]] && { warn "Could not detect distro codename — provide suite explicitly for $name"; skipped=$((skipped+1)); continue; }
+    fi
+    if [[ -z "$comps" ]]; then comps="main"; fi
+
+    echo "deb [signed-by=/etc/apt/keyrings/${name}.gpg] ${url} ${suite} ${comps}" > "$list_file"
+    ok "Wrote $list_file"
+
+    if [[ -n "$key_url" ]]; then
+      mkdir -p /etc/apt/keyrings
+      local fetch_cmd
+      if command -v curl >/dev/null 2>&1; then
+        fetch_cmd="curl -fsSL"
+      else
+        fetch_cmd="wget -qO-"
+      fi
+      $fetch_cmd "$key_url" | gpg --dearmor -o "/etc/apt/keyrings/${name}.gpg" >/dev/null 2>&1 || {
+        warn "Failed to fetch key for $name from $key_url"
+      }
+      ok "Fetched key for $name"
+    else
+      warn "No key URL for $name — you may need to add the signing key manually"
+    fi
+    added=$((added+1))
+  done
+
+  info "Running apt-get update"
+  apt-get update -qq
+  ok "add-repo complete (added=$added skipped=$skipped)"
+}
+
+# ===========================================================================
 # Section: apt-upgrade
 # ===========================================================================
 section_apt_upgrade() {
@@ -764,6 +877,7 @@ run_section swap        section_swap
 run_section fail2ban    section_fail2ban
 run_section ssh-harden  section_ssh_harden
 run_section apt-upgrade section_apt_upgrade
+run_section add-repo    section_add_repo
 
 # ===========================================================================
 # Summary
@@ -789,6 +903,10 @@ fi
 if is_enabled apt-upgrade; then
   pkg_count=$(dpkg -l 2>/dev/null | wc -l)
   ok "apt:          $pkg_count packages installed"
+fi
+if is_enabled add-repo; then
+  repo_count=$(ls /etc/apt/sources.list.d/*.list 2>/dev/null | wc -l)
+  ok "APT repos:    $repo_count sources.list files"
 fi
 if (( ${#SECTIONS_FAILED[@]} > 0 )); then
   warn "Failed sections: ${SECTIONS_FAILED[*]}"
