@@ -11,6 +11,7 @@ A single Bash script that brings a fresh Ubuntu/Debian server to a sane producti
 7. **SSH hardening** — *advisory only*; prints recommended `sshd_config` and the manual commands to apply them safely
 8. **apt update + upgrade** — runs `apt-get update && apt-get upgrade` (and optional `autoremove`) to bring the system up to date
 9. **Add 3rd-party APT repositories** — *opt-in via `--add-repo`*. Adds repositories from `APT_REPOSITORIES`, then runs `apt update`. Does **not** run upgrade.
+10. **Install baseline server packages** — *opt-in via `--install-defaults`*. Installs the package list from `DEFAULT_PACKAGES` in `.env` (skip already-installed). Comment out packages you don't want.
 
 The script is **idempotent** — re-running it won't break anything.
 
@@ -79,6 +80,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `--no-apt-upgrade` | | Skip `apt update` + `apt upgrade` |
 | `--add-repo` | `-r` | Add 3rd-party repos from `APT_REPOSITORIES`, then `apt update` |
 | `--no-add-repo` | | Skip add-repo |
+| `--install-defaults` | `-p` | Install baseline packages from `DEFAULT_PACKAGES` |
+| `--no-install-defaults` | | Skip install-defaults |
 
 ### Selection rules
 
@@ -104,6 +107,8 @@ sudo ./setup.sh --non-interactive        # skip prompts, fail fast on missing va
 | `FAIL2BAN_MAXRETRY` | failures before ban | `5` | no |
 | `APT_UPGRADE` | `true` = run `apt-get update && apt-get upgrade -y` | `true` | yes |
 | `APT_AUTOREMOVE` | `true` = also run `apt-get autoremove -y` | `false` | no |
+| `APT_REPOSITORIES` | `name\|url[|suite|components|key_url];...` | none | no |
+| `DEFAULT_PACKAGES` | space-separated package list (comment with `#`) | rich default | no |
 | `NONINTERACTIVE` | `true` = skip all prompts, fail on missing | `false` | — |
 
 > **Note on SSH key storage:** the preferred approach is to put your key in a separate file named `ssh_key.pub` in the same directory — no quoting headaches, and easy to `.gitignore`. The script uses `ssh_key.pub` if it exists, then falls back to `SSH_PUBLIC_KEY` in `.env`, then prompts.

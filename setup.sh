@@ -44,6 +44,7 @@ FLAG_FAIL2BAN=""
 FLAG_SSH_HARDEN=""
 FLAG_APT_UPGRADE=""
 FLAG_ADD_REPO=""
+FLAG_INSTALL_DEFAULTS=""
 FLAG_NONINTERACTIVE="false"
 CLI_FLAG_GIVEN=false
 CLI_ENABLE_LIST=()   # section names explicitly enabled via CLI
@@ -72,6 +73,8 @@ Sections (composable; default if no section flag given: run all):
       --no-apt-upgrade  Skip apt update + upgrade
   -r, --add-repo        Add 3rd-party APT repositories from .env, then apt update
       --no-add-repo     Skip add-repo
+  -p, --install-defaults Install baseline server packages from DEFAULT_PACKAGES
+      --no-install-defaults  Skip install-defaults
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
@@ -117,6 +120,8 @@ while (( $# > 0 )); do
     --no-apt-upgrade)      FLAG_APT_UPGRADE=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(apt-upgrade); shift ;;
     -r|--add-repo)         FLAG_ADD_REPO=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(add-repo); shift ;;
     --no-add-repo)         FLAG_ADD_REPO=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(add-repo); shift ;;
+    -p|--install-defaults) FLAG_INSTALL_DEFAULTS=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(install-defaults); shift ;;
+    --no-install-defaults) FLAG_INSTALL_DEFAULTS=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -130,7 +135,7 @@ done
 # (via CLI flag or .env-required-key presence). They never run on a bare
 # `sudo ./setup.sh` with no flags. Other sections default to enabled when
 # no flag is given, and to CLI_ENABLE_LIST when flags are given.
-OPT_IN_SECTIONS=(add-repo)
+OPT_IN_SECTIONS=(add-repo install-defaults)
 _section_is_opt_in() {
   local s="$1"
   for o in "${OPT_IN_SECTIONS[@]}"; do [[ "$o" == "$s" ]] && return 0; done
@@ -337,6 +342,7 @@ required_keys_for_section() {
     ssh-harden) echo "" ;;  # no required key
     apt-upgrade) echo "APT_UPGRADE" ;;
     add-repo)    echo "APT_REPOSITORIES" ;;
+    install-defaults) echo "DEFAULT_PACKAGES" ;;
   esac
 }
 
@@ -369,7 +375,7 @@ fi
 # NONINTERACTIVE preflight — validate everything BEFORE touching the system
 # ===========================================================================
 # Required keys for any enabled section must be present
-for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden; do
+  for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults; do
   is_enabled "$sec" || continue
   rk=$(required_keys_for_section "$sec")
   [[ -z "$rk" ]] && continue
@@ -424,7 +430,7 @@ fi
 # Show plan
 # ===========================================================================
 section "Plan"
-info "Sections enabled: $(for s in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo; do is_enabled "$s" && printf '%s ' "$s"; done)"
+info "Sections enabled: $(for s in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults; do is_enabled "$s" && printf '%s ' "$s"; done)"
 info "Mode: $([[ "$NONINTERACTIVE" == "true" ]] && echo non-interactive || echo interactive)"
 [[ -f "$ENV_FILE" ]] && info "Config: $ENV_FILE"
 echo
@@ -852,6 +858,56 @@ section_apt_upgrade() {
 }
 
 # ===========================================================================
+# Section: install-defaults — install baseline server packages
+# Configured via DEFAULT_PACKAGES in .env (space-separated).
+# Users comment out or remove packages they don't want. Idempotent: skips
+# packages already installed. --install-defaults / -p (or DEFAULT_PACKAGES set
+# in .env) is required to run this section.
+# ===========================================================================
+section_install_defaults() {
+  section "install baseline server packages"
+  if ! command -v apt-get >/dev/null 2>&1; then
+    warn "apt-get not found — skipping (this script targets Debian/Ubuntu)"
+    return 0
+  fi
+
+  local raw="${ENV[DEFAULT_PACKAGES]:-}"
+  if [[ -z "$raw" ]] && [[ "$NONINTERACTIVE" != "true" ]]; then
+    read -r -p "  Enter DEFAULT_PACKAGES (blank to skip): " raw
+  fi
+  if [[ -z "$raw" ]]; then
+    info "No DEFAULT_PACKAGES configured — skipping"
+    return 0
+  fi
+
+  # Parse space-separated list, support inline comments (#)
+  local to_install=()
+  for p in $raw; do
+    [[ "$p" =~ ^# ]] && continue
+    [[ -z "$p" ]] && continue
+    if dpkg -s "$p" >/dev/null 2>&1; then
+      info "already installed: $p"
+    else
+      to_install+=("$p")
+    fi
+  done
+
+  if (( ${#to_install[@]} == 0 )); then
+    ok "All DEFAULT_PACKAGES already installed"
+    return 0
+  fi
+
+  export DEBIAN_FRONTEND=noninteractive
+  info "Installing: ${to_install[*]}"
+  if apt-get install -y -qq "${to_install[@]}"; then
+    ok "Installed ${#to_install[@]} package(s)"
+  else
+    warn "Some packages failed to install — check apt output above"
+    return 1
+  fi
+}
+
+# ===========================================================================
 # Dispatch — run only enabled sections
 # ===========================================================================
 SECTIONS_RUN=()
@@ -878,6 +934,7 @@ run_section fail2ban    section_fail2ban
 run_section ssh-harden  section_ssh_harden
 run_section apt-upgrade section_apt_upgrade
 run_section add-repo    section_add_repo
+run_section install-defaults section_install_defaults
 
 # ===========================================================================
 # Summary
@@ -907,6 +964,14 @@ fi
 if is_enabled add-repo; then
   repo_count=$(ls /etc/apt/sources.list.d/*.list 2>/dev/null | wc -l)
   ok "APT repos:    $repo_count sources.list files"
+fi
+if is_enabled install-defaults; then
+  installed=0
+  for p in ${ENV[DEFAULT_PACKAGES]:-}; do
+    [[ -z "$p" || "$p" =~ ^# ]] && continue
+    dpkg -s "$p" >/dev/null 2>&1 && installed=$((installed+1))
+  done
+  ok "DEFAULT_PACKAGES:  $installed installed"
 fi
 if (( ${#SECTIONS_FAILED[@]} > 0 )); then
   warn "Failed sections: ${SECTIONS_FAILED[*]}"
