@@ -28,6 +28,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Canonical section list — used by is_enabled auto-detect, Plan, Summary, and
+# NONINTERACTIVE preflight. Keep in sync with run_section calls at the bottom.
+SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults)
+
 # ===========================================================================
 # CLI argument parsing
 # ===========================================================================
@@ -160,15 +164,6 @@ is_enabled() {
     return 1
   fi
   return 0
-}
-
-# Override helper — if CLI flag set a value, it wins over .env
-cli_value() {
-  local key="$1"
-  case "$key" in
-    hostname) printf '%s' "${CLI_HOSTNAME_VALUE:-}" ;;
-    *) printf '' ;;
-  esac
 }
 
 # ===========================================================================
@@ -350,7 +345,7 @@ if [[ "$NONINTERACTIVE" == "false" ]]; then
   # Check if all required keys for enabled sections are present in .env
   auto_ok=true
   auto_missing=()
-  for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo; do
+  for sec in "${SECTIONS[@]}"; do
     is_enabled "$sec" || continue
     rk=$(required_keys_for_section "$sec")
     [[ -z "$rk" ]] && continue
@@ -375,7 +370,7 @@ fi
 # NONINTERACTIVE preflight — validate everything BEFORE touching the system
 # ===========================================================================
 # Required keys for any enabled section must be present
-  for sec in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults; do
+for sec in "${SECTIONS[@]}"; do
   is_enabled "$sec" || continue
   rk=$(required_keys_for_section "$sec")
   [[ -z "$rk" ]] && continue
@@ -430,7 +425,7 @@ fi
 # Show plan
 # ===========================================================================
 section "Plan"
-info "Sections enabled: $(for s in timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults; do is_enabled "$s" && printf '%s ' "$s"; done)"
+info "Sections enabled: $(for s in "${SECTIONS[@]}"; do is_enabled "$s" && printf '%s ' "$s"; done)"
 info "Mode: $([[ "$NONINTERACTIVE" == "true" ]] && echo non-interactive || echo interactive)"
 [[ -f "$ENV_FILE" ]] && info "Config: $ENV_FILE"
 echo
@@ -703,7 +698,8 @@ EOF
 # ===========================================================================
 # Section: ssh-harden (advisory)
 # ===========================================================================
-section_ssh_harden() {  section "SSH hardening — ADVISORY ONLY"
+section_ssh_harden() {
+  section "SSH hardening — ADVISORY ONLY"
   info "Recommended /etc/ssh/sshd_config settings:"
   cat <<'EOF'
     PasswordAuthentication no
