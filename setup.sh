@@ -35,20 +35,12 @@ SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrad
 # ===========================================================================
 # CLI argument parsing
 # ===========================================================================
-# After parsing, each of these holds "true" or "false".
+# After parsing, CLI_FLAG_GIVEN + CLI_ENABLE_LIST + CLI_DISABLE_LIST hold the
+# resolved enable state. Section enablement is decided by is_enabled() using
+# these lists, not by per-section FLAG_* variables.
 # Default: all sections enabled (matches old "run everything" behavior).
 # If user passes any --<feature> or --no-<feature>, we start with NONE
 # enabled and only enable what was explicitly requested.
-FLAG_TIMEZONE=""
-FLAG_HOSTNAME=""
-FLAG_FIREWALL=""
-FLAG_SSH_KEY=""
-FLAG_SWAP=""
-FLAG_FAIL2BAN=""
-FLAG_SSH_HARDEN=""
-FLAG_APT_UPGRADE=""
-FLAG_ADD_REPO=""
-FLAG_INSTALL_DEFAULTS=""
 FLAG_NONINTERACTIVE="false"
 CLI_FLAG_GIVEN=false
 CLI_ENABLE_LIST=()   # section names explicitly enabled via CLI
@@ -102,30 +94,30 @@ EOF
 # Parse args
 while (( $# > 0 )); do
   case "$1" in
-    -t|--timezone)         FLAG_TIMEZONE=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(timezone); shift ;;
-    --no-timezone)         FLAG_TIMEZONE=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(timezone); shift ;;
-    -n|--hostname)         FLAG_HOSTNAME=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(hostname); shift ;;
-      --hostname=*)        FLAG_HOSTNAME=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(hostname)
+    -t|--timezone)         CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(timezone); shift ;;
+    --no-timezone)         CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(timezone); shift ;;
+    -n|--hostname)         CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(hostname); shift ;;
+      --hostname=*)        CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(hostname)
                            CLI_HOSTNAME_VALUE="${1#*=}"; shift ;;
-      --hostname)          FLAG_HOSTNAME=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(hostname)
+      --hostname)          CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(hostname)
                            [[ "${2:-}" =~ ^[^-] ]] && { CLI_HOSTNAME_VALUE="$2"; shift; }; shift ;;
-    --no-hostname)         FLAG_HOSTNAME=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(hostname); shift ;;
-    -f|--firewall)         FLAG_FIREWALL=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(firewall); shift ;;
-    --no-firewall)         FLAG_FIREWALL=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(firewall); shift ;;
-    -k|--ssh-key)          FLAG_SSH_KEY=true;   CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(ssh-key); shift ;;
-    --no-ssh-key)          FLAG_SSH_KEY=false;  CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(ssh-key); shift ;;
-    -s|--swap)             FLAG_SWAP=true;      CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(swap); shift ;;
-    --no-swap)             FLAG_SWAP=false;     CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(swap); shift ;;
-    -b|--fail2ban)         FLAG_FAIL2BAN=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(fail2ban); shift ;;
-    --no-fail2ban)         FLAG_FAIL2BAN=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(fail2ban); shift ;;
-    --ssh-harden)          FLAG_SSH_HARDEN=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(ssh-harden); shift ;;
-    --no-ssh-harden)       FLAG_SSH_HARDEN=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(ssh-harden); shift ;;
-    -u|--apt-upgrade)      FLAG_APT_UPGRADE=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(apt-upgrade); shift ;;
-    --no-apt-upgrade)      FLAG_APT_UPGRADE=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(apt-upgrade); shift ;;
-    -r|--add-repo)         FLAG_ADD_REPO=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(add-repo); shift ;;
-    --no-add-repo)         FLAG_ADD_REPO=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(add-repo); shift ;;
-    -p|--install-defaults) FLAG_INSTALL_DEFAULTS=true;  CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(install-defaults); shift ;;
-    --no-install-defaults) FLAG_INSTALL_DEFAULTS=false; CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
+    --no-hostname)         CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(hostname); shift ;;
+    -f|--firewall)         CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(firewall); shift ;;
+    --no-firewall)         CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(firewall); shift ;;
+    -k|--ssh-key)          CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(ssh-key); shift ;;
+    --no-ssh-key)          CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(ssh-key); shift ;;
+    -s|--swap)             CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(swap); shift ;;
+    --no-swap)             CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(swap); shift ;;
+    -b|--fail2ban)         CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(fail2ban); shift ;;
+    --no-fail2ban)         CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(fail2ban); shift ;;
+    --ssh-harden)          CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(ssh-harden); shift ;;
+    --no-ssh-harden)       CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(ssh-harden); shift ;;
+    -u|--apt-upgrade)      CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(apt-upgrade); shift ;;
+    --no-apt-upgrade)      CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(apt-upgrade); shift ;;
+    -r|--add-repo)         CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(add-repo); shift ;;
+    --no-add-repo)         CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(add-repo); shift ;;
+    -p|--install-defaults) CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(install-defaults); shift ;;
+    --no-install-defaults) CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -308,6 +300,7 @@ validate_port_spec() {
       return 1
     fi
   done
+  return 0
 }
 
 validate_positive_int() {
@@ -316,6 +309,7 @@ validate_positive_int() {
     err "$key must be a positive integer, got: '$val'"
     return 1
   fi
+  return 0
 }
 
 # ===========================================================================
