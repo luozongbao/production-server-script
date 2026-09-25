@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Canonical section list — used by is_enabled auto-detect, Plan, Summary, and
 # NONINTERACTIVE preflight. Keep in sync with run_section calls at the bottom.
-SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults)
+SECTIONS=(timezone hostname firewall ssh-key swap fail2ban ssh-harden apt-upgrade add-repo install-defaults prompt msmtp server-report)
 
 # ===========================================================================
 # CLI argument parsing
@@ -69,8 +69,15 @@ Sections (composable; default if no section flag given: run all):
       --no-apt-upgrade  Skip apt update + upgrade
   -r, --add-repo        Add 3rd-party APT repositories from .env, then apt update
       --no-add-repo     Skip add-repo
-  -p, --install-defaults Install baseline server packages from DEFAULT_PACKAGES
-      --no-install-defaults  Skip install-defaults
+  -i, --install-packages Install baseline server packages from DEFAULT_PACKAGES
+      --no-install-packages  Skip install-packages
+  -p, --prompt          Install managed colored PS1 block into ~/.bashrc
+      --no-prompt       Skip prompt customization
+  -m, --msmtp           Configure msmtp SMTP client (auto-detect or install)
+      --no-msmtp        Skip msmtp configuration
+  -R, --server-report   Install luozongbao/server-report-script from a GitHub
+                        release zip (opt-in; see issues/011.md)
+      --no-server-report  Skip server-report install
 
 Behavior:
   -y, --non-interactive Skip all prompts; fail fast on missing required values
@@ -116,8 +123,14 @@ while (( $# > 0 )); do
     --no-apt-upgrade)      CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(apt-upgrade); shift ;;
     -r|--add-repo)         CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(add-repo); shift ;;
     --no-add-repo)         CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(add-repo); shift ;;
-    -p|--install-defaults) CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(install-defaults); shift ;;
-    --no-install-defaults) CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
+    -i|--install-packages) CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(install-defaults); shift ;;
+    --no-install-packages) CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(install-defaults); shift ;;
+    -p|--prompt)           CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(prompt); shift ;;
+    --no-prompt)           CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(prompt); shift ;;
+    -m|--msmtp)            CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(msmtp); shift ;;
+    --no-msmtp)            CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(msmtp); shift ;;
+    -R|--server-report)    CLI_FLAG_GIVEN=true; CLI_ENABLE_LIST+=(server-report); shift ;;
+    --no-server-report)    CLI_FLAG_GIVEN=true; CLI_DISABLE_LIST+=(server-report); shift ;;
     -y|--non-interactive)  FLAG_NONINTERACTIVE=true; shift ;;
     -h|--help)             usage; exit 0 ;;
     --)                    shift; break ;;
@@ -131,7 +144,10 @@ done
 # (via CLI flag or .env-required-key presence). They never run on a bare
 # `sudo ./setup.sh` with no flags. Other sections default to enabled when
 # no flag is given, and to CLI_ENABLE_LIST when flags are given.
-OPT_IN_SECTIONS=(add-repo install-defaults)
+# `msmtp` is intentionally NOT in OPT_IN_SECTIONS — it is part of RUN ALL
+# (sudo ./setup.sh with no flags), gated by --no-msmtp. Use --msmtp/-m in
+# selective runs. See issues/012.md for the design.
+OPT_IN_SECTIONS=(add-repo install-defaults prompt server-report)
 _section_is_opt_in() {
   local s="$1"
   for o in "${OPT_IN_SECTIONS[@]}"; do [[ "$o" == "$s" ]] && return 0; done
@@ -337,6 +353,12 @@ required_keys_for_section() {
     apt-upgrade) echo "APT_UPGRADE" ;;
     add-repo)    echo "APT_REPOSITORIES" ;;
     install-defaults) echo "DEFAULT_PACKAGES" ;;
+    prompt)      echo "PROMPT_ENABLED" ;;
+    server-report) echo "SERVER_REPORT_SCIPT_LINK" ;;
+    # msmtp has no required-key check: HOST/USER are required at section
+    # time (inside section_msmtp), not at auto-detect time. Adding a key
+    # here would just confuse the NONINTERACTIVE preflight, since the
+    # password is interactive-only by design.
   esac
 }
 
@@ -874,8 +896,12 @@ section_apt_upgrade() {
 # Section: install-defaults — install baseline server packages
 # Configured via DEFAULT_PACKAGES in .env (space-separated).
 # Users comment out or remove packages they don't want. Idempotent: skips
-# packages already installed. --install-defaults / -p (or DEFAULT_PACKAGES set
+# packages already installed. --install-packages / -i (or DEFAULT_PACKAGES set
 # in .env) is required to run this section.
+#
+# Note: the section is still called "install-defaults" internally for
+# backwards compatibility. The CLI flag was renamed from --install-defaults / -p
+# to --install-packages / -i in v1.1.0 because -p was reassigned to --prompt.
 # ===========================================================================
 section_install_defaults() {
   section "install baseline server packages"
@@ -921,6 +947,324 @@ section_install_defaults() {
 }
 
 # ===========================================================================
+# Section: prompt — install managed colored PS1 block into TARGET_USER's bashrc
+#
+# Writes a guarded, idempotent block to ~/.bashrc. The block only sets PS1
+# once per shell (PROMPT_OVERRIDE guard) and uses >>><<< markers so re-running
+# setup.sh replaces the block in place instead of appending duplicates.
+#
+# The PS1 string itself is either PROMPT_PS1_TEMPLATE from .env, or the
+# built-in default below. The default uses git symbolic-ref (works on repos
+# with zero commits) and a single \D{} call (1 fork per prompt instead of 3).
+# ===========================================================================
+section_bashrc() {
+  section "Install managed PS1 block into $TARGET_USER's .bashrc"
+
+  # Resolve target user + home (TARGET_USER/TARGET_HOME set earlier in script)
+  local bashrc="$TARGET_HOME/.bashrc"
+  local marker_start="# >>> production-server-script:PROMPT >>>"
+  local marker_end="# <<< production-server-script:PROMPT <<<"
+
+  # If the user explicitly disabled this section via .env, respect that even
+  # if they forgot to pass --no-prompt on the CLI.
+  if [[ "${ENV[PROMPT_ENABLED]:-}" =~ ^[Ff]alse$ ]]; then
+    info "PROMPT_ENABLED=false in .env — removing any existing block"
+    if [[ -f "$bashrc" ]] && grep -qF "$marker_start" "$bashrc"; then
+      # Strip the marker block + the trailing blank line if present
+      sed -i "/${marker_start}/,/${marker_end}/d" "$bashrc"
+      ok "Removed existing PS1 block from $bashrc"
+    else
+      info "No existing block to remove"
+    fi
+    return 0
+  fi
+
+  # Determine PS1 string: .env override OR built-in default
+  local ps1="${ENV[PROMPT_PS1_TEMPLATE]:-}"
+  if [[ -z "$ps1" ]]; then
+    ps1='\[\033[1;90m\]\D{%y-%m-%d %H:%M}\[\033[0m\] \[\033[1;32m\]\u@\h\[\033[0m\]:\[\033[1;34m\]\w\[\033[0;33m\]$(b=$(git symbolic-ref --short HEAD 2>/dev/null); [[ -n "$b" ]] && printf " (%s)" "$b")\[\033[0m\]\$ '
+    info "Using built-in default PS1 (set PROMPT_PS1_TEMPLATE in .env to override)"
+  else
+    info "Using PROMPT_PS1_TEMPLATE from .env"
+  fi
+
+  # Sanity-check: PS1 must contain at least one of \u, \h, or \$ to be useful
+  if [[ "$ps1" != *'\\u'* && "$ps1" != *'\\h'* && "$ps1" != *'\\$'* && "$ps1" != *'\$'* ]]; then
+    warn "PROMPT_PS1_TEMPLATE doesn't contain \\u, \\h, or \\$ — prompt will be empty. Skipping."
+    return 1
+  fi
+
+  # Build the block. Single-quote the heredoc so $ps1 is NOT expanded here
+  # — we want the literal PS1=... text in .bashrc, not the expanded version.
+  local block
+  block=$(cat <<EOF
+$marker_start
+if [[ -z "\${PROMPT_OVERRIDE:-}" ]]; then
+  export PROMPT_OVERRIDE=1
+  export PS1='$ps1'
+fi
+$marker_end
+EOF
+  )
+
+  # Make sure ~/.bashrc exists and is owned by TARGET_USER
+  if [[ ! -f "$bashrc" ]]; then
+    info "Creating $bashrc (did not exist)"
+    touch "$bashrc"
+  fi
+  chown "$TARGET_USER":"$TARGET_USER" "$bashrc" 2>/dev/null || true
+
+  # Idempotent: replace existing block in place, OR append
+  if grep -qF "$marker_start" "$bashrc"; then
+    # Use a python-free approach: extract lines NOT in the marker range,
+    # then append the new block. We use awk for portability (BSD/GNU both).
+    local tmpfile
+    tmpfile=$(mktemp)
+    awk -v start="$marker_start" -v end="$marker_end" \
+      '$0 == start { skip=1; next } $0 == end { skip=0; next } !skip { print }' \
+      "$bashrc" > "$tmpfile"
+    # Ensure file ends with a newline before we append
+    [[ -s "$tmpfile" && $(tail -c1 "$tmpfile" | wc -l) -eq 0 ]] && echo >> "$tmpfile"
+    printf '%s\n' "$block" >> "$tmpfile"
+    cat "$tmpfile" > "$bashrc"
+    rm -f "$tmpfile"
+    ok "Replaced existing PS1 block in $bashrc"
+  else
+    # Append, with a leading blank line for readability
+    [[ -s "$bashrc" && $(tail -c1 "$bashrc" | wc -l) -eq 0 ]] || echo >> "$bashrc"
+    printf '%s\n' "$block" >> "$bashrc"
+    ok "Appended PS1 block to $bashrc"
+  fi
+
+  chown "$TARGET_USER":"$TARGET_USER" "$bashrc" 2>/dev/null || true
+  ok "PS1 block installed for $TARGET_USER (login or 'source ~/.bashrc' to activate)"
+}
+
+# ===========================================================================
+# Section: msmtp — configure msmtp SMTP client (~/.msmtprc)
+#
+# Installs msmtp + msmtp-mta via apt if missing, then writes a managed
+# ~/.msmtprc for TARGET_USER with mode 0600 (msmtp refuses to run with
+# looser permissions). Required .env keys: MSMTP_HOST, MSMTP_USER. The
+# password is ALWAYS prompted interactively (no .env secret, no password
+# file — by design). Fails fast if any required key is missing or stdin
+# is not a TTY.
+# ===========================================================================
+section_msmtp() {
+  section "msmtp SMTP client configuration"
+
+  # Step 1: install msmtp + msmtp-mta via apt if not present. .msmtprc is
+  # written for TARGET_USER even if msmtp was already on the system.
+  if ! command -v msmtp >/dev/null 2>&1; then
+    if ! command -v apt-get >/dev/null 2>&1; then
+      warn "apt-get not found — cannot install msmtp automatically"
+    else
+      info "msmtp not installed — installing via apt"
+      export DEBIAN_FRONTEND=noninteractive
+      if ! apt-get install -y -qq msmtp msmtp-mta; then
+        err "apt-get install msmtp failed — check apt output above"
+        return 1
+      fi
+      ok "msmtp installed"
+    fi
+  fi
+
+  # Step 2: bail if msmtp still not available
+  if ! command -v msmtp >/dev/null 2>&1; then
+    info "msmtp not present and apt install failed — skipping"
+    return 0
+  fi
+
+  # Step 3: read SMTP settings from .env. ALL required keys must be set;
+  # if any is blank we exit with a clear "set these keys" message instead
+  # of silently prompting for a secret-bearing value.
+  local host="${ENV[MSMTP_HOST]:-}"
+  local port="${ENV[MSMTP_PORT]:-587}"
+  local user="${ENV[MSMTP_USER]:-}"
+  local from="${ENV[MSMTP_FROM]:-}"
+  local missing=()
+  [[ -z "$host" ]] && missing+=(MSMTP_HOST)
+  [[ -z "$user" ]] && missing+=(MSMTP_USER)
+  if (( ${#missing[@]} > 0 )); then
+    err "missing required .env keys: ${missing[*]}"
+    err "set them in .env and re-run, or pass --no-msmtp to skip this section"
+    return 1
+  fi
+  [[ -z "$port" ]] && port="587"
+  [[ -z "$from" ]] && from="$user"
+
+  # Step 4: collect the SMTP password interactively. Always — there is no
+  # MSMTP_PASSWORD_FILE path; the section refuses to run non-interactively.
+  # The password is NEVER stored in .env by design.
+  if [[ ! -t 0 ]]; then
+    err "msmtp requires interactive input (password); rerun without --non-interactive"
+    return 1
+  fi
+  local pass
+  while :; do
+    local pass1 pass2
+    read -r -s -p "  SMTP password: " pass1; echo
+    [[ -z "$pass1" ]] && { warn "password cannot be empty"; continue; }
+    read -r -s -p "  Confirm password: " pass2; echo
+    if [[ "$pass1" != "$pass2" ]]; then
+      warn "passwords do not match — try again (Ctrl-C to abort)"
+      continue
+    fi
+    pass="$pass1"
+    unset pass1 pass2
+    break
+  done
+  # Belt + suspenders: never let the password linger in this function's
+  # scope after the config file is written.
+  trap 'unset pass' RETURN
+
+  # Step 5: existing /home/$TARGET_USER/.msmtprc → overwrite (default) or
+  # abort. Merge was considered and rejected (see issues/012.md §Design).
+  local rcfile="$TARGET_HOME/.msmtprc"
+  if [[ -f "$rcfile" ]]; then
+    local ans="o"
+    read -r -p "  $rcfile already exists. [o]verwrite / [a]bort [o]: " ans
+    case "$ans" in
+      a|A) info "aborted; existing $rcfile preserved"; return 0 ;;
+      *)   cp -a "$rcfile" "${rcfile}.bak.$(date +%Y%m%d-%H%M%S)" ;;
+    esac
+  fi
+
+  # Step 6: write /home/$TARGET_USER/.msmtprc — full overwrite, mode 0600.
+  mkdir -p "$(dirname "$rcfile")"
+  install -m 0600 -o "$TARGET_USER" -g "$TARGET_USER" \
+    /dev/null "$rcfile"   # create or truncate, mode 0600, owner TARGET_USER
+  cat > "$rcfile" <<'MSMTPRC_EOF'
+# Managed by production-server-script — do not edit by hand.
+# To update, edit MSMTP_* values in .env and re-run setup.sh.
+defaults
+auth           on
+tls            on
+tls_starttls   on
+tls_trust_file /etc/ssl/certs/ca-certificates.crt
+logfile        ~/.msmtp.log
+
+account        default
+MSMTPRC_EOF
+  # Append the variable fields. printf with %s quoting keeps the password
+  # safe from globbing / word-splitting / %-expansion.
+  {
+    printf 'host           %s\n' "$host"
+    printf 'port           %s\n' "$port"
+    printf 'from           %s\n' "$from"
+    printf 'user           %s\n' "$user"
+    printf 'password       %s\n' "$pass"
+  } >> "$rcfile"
+  ok "Wrote $rcfile (mode 600, owner $TARGET_USER)"
+}
+
+# ===========================================================================
+# Section: server-report — pull and install luozongbao/server-report-script
+#
+# Opt-in section. Reads SERVER_REPORT_SCIPT_LINK from .env — the full URL
+# to a GitHub release zip (e.g. https://github.com/.../archive/refs/tags/v.2.0.zip).
+# Default points at the latest upstream tag at install time.
+#
+# What the section does:
+#   1. curl -fsSL the zip into a tempdir
+#   2. unzip into /opt/server-report-script/
+#   3. run the upstream install.sh (sudo install.sh) which handles the
+#      actual placement: scripts -> /usr/local/bin/{auth,attack,memory}-report.sh,
+#      lib/ -> /usr/local/share/server-report-script/lib/, and seeds
+#      /etc/server-report-script.env (mode 0600) from .env.example.
+#
+# We do NOT symlink /usr/local/bin ourselves (install.sh owns those paths).
+# We do NOT verify checksums (upstream does not publish .sha256 files).
+# We do NOT prompt for a version — the .env key IS the link.
+#
+# NO GitHub API call, NO git clone — works on hosts that can reach
+# github.com but NOT api.github.com (common on China-region networks).
+#
+# Idempotent: install.sh is idempotent by design (safe to re-run).
+# ===========================================================================
+section_server_report() {
+  section "Install luozongbao/server-report-script"
+
+  local install_dir="/opt/server-report-script"
+  local url="${ENV[SERVER_REPORT_SCIPT_LINK]:-https://github.com/luozongbao/server-report-script/archive/refs/tags/v.2.0.zip}"
+
+  # Defense in depth: only allow https URLs to github.com. A malformed .env
+  # value (http://, file://, custom scheme) is a configuration error — exit
+  # non-zero before any curl touches disk.
+  if [[ ! "$url" =~ ^https://github\.com/ ]]; then
+    err "Invalid SERVER_REPORT_SCIPT_LINK: '$url'"
+    err "Expected an https://github.com/... release-zip URL"
+    return 1
+  fi
+
+  local tmpdir archive
+  tmpdir=$(mktemp -d) || { err "mktemp failed"; return 1; }
+  archive="$tmpdir/server-report.zip"
+
+  info "Downloading $url"
+  if ! curl -fsSL -o "$archive" "$url"; then
+    err "Download failed: $url"
+    err "Check the URL is reachable and points at a valid release asset"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  local size; size=$(stat -c '%s' "$archive" 2>/dev/null || echo 0)
+  ok "Downloaded $size bytes"
+
+  # Re-create /opt/server-report-script/ from the zip. We remove the dir and
+  # recreate it so perms / ownership on a re-install are predictable; any
+  # symlink at /usr/local/bin/server-report pointing into this tree is left
+  # untouched (it just dangles until install.sh below rewrites the real path).
+  mkdir -p "$install_dir"
+  find "$install_dir" -mindepth 1 -delete 2>/dev/null || true
+  if ! unzip -q "$archive" -d "$tmpdir"; then
+    err "unzip failed — archive may be corrupt"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  # GitHub zips produce a single top-level dir named after the repo + tag.
+  # Bail with a clear error if the layout is unexpected.
+  local extracted_top
+  extracted_top=$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d ! -name '.*' | head -n1)
+  if [[ -z "$extracted_top" ]] || [[ ! -d "$extracted_top" ]]; then
+    err "Unexpected zip layout — no top-level directory found in archive"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  shopt -s dotglob
+  if ! cp -a "$extracted_top"/. "$install_dir"/; then
+    shopt -u dotglob
+    err "Failed to copy extracted files into $install_dir"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+  shopt -u dotglob
+  rm -rf "$tmpdir"
+  ok "Installed to $install_dir"
+
+  # Hand off to the upstream installer. install.sh is itself idempotent and
+  # places scripts at /usr/local/bin/{auth,attack,memory}-report.sh (0755),
+  # lib/ at /usr/local/share/server-report-script/lib/ (0644), and seeds
+  # /etc/server-report-script.env (0600) from .env.example. We do NOT need
+  # to create any symlinks ourselves.
+  if [[ -x "$install_dir/install.sh" ]]; then
+    info "Running upstream installer (sudo $install_dir/install.sh)"
+    if sudo "$install_dir/install.sh"; then
+      ok "Upstream installer finished"
+    else
+      err "Upstream install.sh exited non-zero — install may be incomplete"
+      err "Re-run later with: sudo $install_dir/install.sh"
+      return 1
+    fi
+  else
+    err "Expected $install_dir/install.sh to exist and be executable"
+    return 1
+  fi
+}
+
+# ===========================================================================
 # Dispatch — run only enabled sections
 # ===========================================================================
 SECTIONS_RUN=()
@@ -948,6 +1292,9 @@ run_section ssh-harden  section_ssh_harden
 run_section apt-upgrade section_apt_upgrade
 run_section add-repo    section_add_repo
 run_section install-defaults section_install_defaults
+run_section prompt      section_bashrc
+run_section msmtp       section_msmtp
+run_section server-report section_server_report
 
 # ===========================================================================
 # Summary
@@ -985,6 +1332,28 @@ if is_enabled install-defaults; then
     dpkg -s "$p" >/dev/null 2>&1 && installed=$((installed+1))
   done
   ok "DEFAULT_PACKAGES:  $installed installed"
+fi
+if is_enabled prompt; then
+  if [[ -f "$TARGET_HOME/.bashrc" ]] && grep -qF 'production-server-script:PROMPT' "$TARGET_HOME/.bashrc"; then
+    ok "Prompt:       installed in $TARGET_HOME/.bashrc"
+  else
+    warn "Prompt:       enabled but block not found in $TARGET_HOME/.bashrc"
+  fi
+fi
+if is_enabled msmtp; then
+  if command -v msmtp >/dev/null 2>&1; then
+    rc_status="$([ -f "$TARGET_HOME/.msmtprc" ] && stat -c '%a' "$TARGET_HOME/.msmtprc" 2>/dev/null || echo missing)"
+    ok "msmtp:        installed, $TARGET_HOME/.msmtprc (mode $rc_status)"
+  else
+    warn "msmtp:        enabled but binary not found"
+  fi
+fi
+if is_enabled server-report; then
+  if [[ -x /usr/local/bin/auth-report.sh && -x /usr/local/bin/attack-report.sh && -x /usr/local/bin/memory-report.sh ]]; then
+    ok "server-report: scripts installed to /usr/local/bin/{auth,attack,memory}-report.sh"
+  else
+    warn "server-report: enabled but one or more scripts missing from /usr/local/bin/"
+  fi
 fi
 if (( ${#SECTIONS_FAILED[@]} > 0 )); then
   warn "Failed sections: ${SECTIONS_FAILED[*]}"
