@@ -1249,9 +1249,22 @@ section_server_report() {
   # lib/ at /usr/local/share/server-report-script/lib/ (0644), and seeds
   # /etc/server-report-script.env (0600) from .env.example. We do NOT need
   # to create any symlinks ourselves.
+  #
+  # IMPORTANT: do NOT wrap this in `sudo`. setup.sh already runs as root
+  # (it checks $EUID -ne 0 at startup). Calling `sudo install.sh` from a
+  # root shell leaves $SUDO_USER empty in the child — sudo only sets
+  # $SUDO_USER when a non-root user invokes it. Upstream install.sh uses
+  # $SUDO_USER (or logname fallback) to find the invoking user and seed
+  # ~/.config/server-report-script/.env. With $SUDO_USER empty and no
+  # login session (we're root), upstream prints:
+  #   "Cannot determine invoking user (no $SUDO_USER ...)"
+  # and skips the per-user config seeding.
+  #
+  # Fix: invoke install.sh directly (we're already root), and pass
+  # $SUDO_USER=$TARGET_USER inline so upstream can find the user.
   if [[ -x "$install_dir/install.sh" ]]; then
-    info "Running upstream installer (sudo $install_dir/install.sh)"
-    if sudo "$install_dir/install.sh"; then
+    info "Running upstream installer (with SUDO_USER=$TARGET_USER)"
+    if SUDO_USER="$TARGET_USER" "$install_dir/install.sh"; then
       ok "Upstream installer finished"
     else
       err "Upstream install.sh exited non-zero — install may be incomplete"
