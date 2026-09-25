@@ -239,13 +239,13 @@ env_or_prompt() {
   # CLI flag override wins
   if [[ "$key" == "HOSTNAME" ]] && [[ -n "${CLI_HOSTNAME_VALUE:-}" ]]; then
     val="$CLI_HOSTNAME_VALUE"
-    printf '  %s (from CLI)\n' "$val"
+    printf '  %s (from CLI)\n' "$val" >&2
     printf '%s' "$val"
     return 0
   fi
 
   if [[ -n "$val" ]]; then
-    printf '  %s (from .env)\n' "$val"
+    printf '  %s (from .env)\n' "$val" >&2
     printf '%s' "$val"
     return 0
   fi
@@ -462,7 +462,7 @@ section_timezone() {
   section "Timezone"
   current_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "unknown")
   info "Current timezone: $current_tz"
-  new_tz=$(env_or_prompt "TIMEZONE (e.g. Asia/Shanghai, UTC)" "$current_tz") || return 1
+  new_tz=$(env_or_prompt "TIMEZONE" "$current_tz" "TIMEZONE (e.g. Asia/Shanghai, UTC)") || return 1
   validate_timezone "$new_tz" || return 1
   if [[ "$new_tz" != "$current_tz" ]]; then
     timedatectl set-timezone "$new_tz"
@@ -874,7 +874,7 @@ section_apt_upgrade() {
   fi
 
   local apply
-  apply=$(env_or_prompt "APT_UPGRADE (true/false)" "true") || return 1
+  apply=$(env_or_prompt "APT_UPGRADE" "true" "APT_UPGRADE (true/false)") || return 1
   if ! [[ "$apply" =~ ^[Tt]rue$ ]]; then
     info "APT_UPGRADE=$apply — skipping"
     return 0
