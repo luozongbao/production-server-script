@@ -1,5 +1,22 @@
 # Release Notes
 
+## Version 1.1.1 — server-report-script version bump
+
+Patch release pinning the default `SERVER_REPORT_SCIPT_LINK` in `.env.example` to a newer upstream tag of `luozongbao/server-report-script`. No script, flag, or behavior changes — only the default URL changed.
+
+### What's Changed
+
+- `.env.example` — `SERVER_REPORT_SCIPT_LINK` updated from the previous default tag to `https://github.com/luozongbao/server-report-script/archive/refs/tags/v.2.1.0.zip`.
+- Users who already pinned their own URL in `.env` are unaffected; only the example default moved.
+- `setup.sh` and `README.md` references to the historical `v.2.0` default were left intact for traceability — they describe what shipped in v1.1.0, not the current default.
+
+### Upgrade Notes (v1.1.0 → v1.1.1)
+
+- Pull `.env.example` and compare against your `.env` — if you never set `SERVER_REPORT_SCIPT_LINK` yourself, your next fresh `.env` will pick up the new default. Existing `.env` files keep whatever you already had.
+- No other config keys, flags, or scripts changed. Re-running `setup.sh` with your existing `.env` behaves identically to v1.1.0.
+
+---
+
 ## Version 1.1.0 — Prompt, msmtp, and server-report installer
 
 Three new sections ship in this release: a customizable colored shell prompt, an `msmtp` SMTP client configurator, and an opt-in installer for the maintainer's `luozongbao/server-report-script` companion tool. Netplan (#010) was deferred to a future release.
