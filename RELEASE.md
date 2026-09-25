@@ -1,5 +1,105 @@
 # Release Notes
 
+## Version 1.2.0 — env_or_prompt fixes, regression tests, installer SUDO_USER fix
+
+Patch-level version bump driven by three user-visible bugs and a new test framework. No new sections, no flag changes, no `.env` schema changes. All fixes are backward-compatible — existing `.env` files and CI invocations behave identically.
+
+### What's Changed
+
+#### Bug fix — `env_or_prompt` status-line leaked into captured values
+
+`env_or_prompt` printed both the "from .env" status line AND the value on stdout, so callers using command substitution (`new_host=$(env_or_prompt ...)`) captured both. Result: validation rejected values like `"  Test (from .env)\nTest"` with confusing "Invalid hostname" / "Invalid timezone" errors, even though `.env` was correct.
+
+Fix: redirect the status `printf` to `>&2` so only the value is captured by `$()`.
+
+Affects every caller of `env_or_prompt` (timezone, hostname, swap, fail2ban, apt-upgrade).
+
+#### Bug fix — `env_or_prompt` call-site argument order (timezone / apt-upgrade)
+
+`section_timezone` and `section_apt_upgrade` were passing the **prompt label** as the first argument:
+
+```bash
+env_or_prompt "TIMEZONE (e.g. Asia/Shanghai, UTC)" "$current_tz"   # WRONG
+```
+
+The function signature is `env_or_prompt KEY [DEFAULT] [LABEL]` — the first arg must be the literal `.env` key. With the label as the key, the function looked up `ENV["TIMEZONE (e.g. Asia/Shanghai, UTC)"]` (which doesn't exist), fell through to the interactive prompt, and the `.env` value was silently ignored.
+
+Fix: pass the key as the 1st arg, the label as the 3rd:
+
+```bash
+env_or_prompt "TIMEZONE" "$current_tz" "TIMEZONE (e.g. Asia/Shanghai, UTC)"   # RIGHT
+```
+
+Hostname / swap / fail2ban callers were already correct (they used bare keys).
+
+#### Bug fix — server-report installer lost `$SUDO_USER` (per-user config skipped)
+
+The `server-report` section invoked the upstream installer as:
+
+```bash
+sudo "$install_dir/install.sh"
+```
+
+…from a root shell (setup.sh itself is root — it checks `$EUID -ne 0` at startup). `sudo` only sets `$SUDO_USER` when a non-root user invokes it; from a root parent, the child process had empty `$SUDO_USER` and no login session. Upstream's `install.sh` then printed:
+
+```
+⚠️  Cannot determine invoking user (no $SUDO_USER (script was not invoked via sudo from a non-root user)).
+⚠️  Skipping .env seeding. To create one manually:
+```
+
+…and skipped `~/.config/server-report-script/.env` seeding.
+
+Fix: invoke install.sh directly (we're already root) and pass `SUDO_USER` inline:
+
+```bash
+SUDO_USER="$TARGET_USER" "$install_dir/install.sh"
+```
+
+This makes `$SUDO_USER` available to upstream without requiring nested sudo. `TARGET_USER` is already defined in global scope (line 560 of setup.sh), so the value is the same user the ssh-key / prompt / msmtp sections target.
+
+#### New — regression test framework
+
+Added `tests/` directory with:
+
+- `tests/run-all.sh` — discovers and runs every `test_*.sh`, prints summary, suitable for CI.
+- `tests/test_env_or_prompt.sh` — 12 assertions covering the stdout/stderr split, CLI override path, 3-arg call shape, and a static audit of all `env_or_prompt` call sites in `setup.sh` (rejects any caller passing a label as the 1st arg).
+- `tests/test_server_report_sudo.sh` — 4 assertions verifying the server-report section does NOT call `sudo install.sh`, DOES pass `SUDO_USER=$TARGET_USER` inline, and that the explanatory comment is present.
+- `tests/README.md` — how to run, conventions for adding more tests.
+
+Total: **16 assertions** guarding the three bugs above. Each was verified to fail against the buggy code and pass against the fix.
+
+Pure bash, no dependencies, no root, no network. Run anywhere:
+
+```bash
+bash tests/run-all.sh
+```
+
+#### .env.example — `SERVER_REPORT_SCIPT_LINK` bumped to v2.1.1
+
+Same pattern as the 1.1.1 bump — no key rename, no flag change. Users who pinned their own URL in `.env` are unaffected.
+
+### Safety Guarantees (v1.2.0 additions)
+
+- **`env_or_prompt` cannot leak status into captured values** — verified by static test that all `printf` calls inside the function either target stderr or are the final `printf '%s' "$val"` on stdout.
+- **`env_or_prompt` callers cannot pass a label as the key** — verified by static audit that every first argument matches `^[A-Z_][A-Z0-9_]*$`.
+- **`server-report` cannot lose `$SUDO_USER`** — verified by static test that no `sudo "$install_dir/install.sh"` invocation exists and that `SUDO_USER=...` precedes the `install.sh` call.
+
+### Upgrade Notes (v1.1.1 → v1.2.0)
+
+- No `.env` changes required. No flag changes. No behavior changes for any section that worked in v1.1.1.
+- The three bugs above were silent (no error from setup.sh itself) — the only symptoms were downstream failures (hostname/timezone validation errors, upstream "Cannot determine invoking user" warning). If you've worked around either by hand-editing values or manually seeding `~/.config/server-report-script/.env`, the fixes here eliminate the need.
+- Optional: run `bash tests/run-all.sh` after pulling to verify your environment (no setup needed — pure bash).
+
+### Tested On
+
+- Ubuntu 22.04 LTS
+- Ubuntu 24.04 LTS
+- Debian 12 (bookworm)
+
+Other systemd Debian-family distros should work but are untested.
+
+---
+
 ## Version 1.1.1 — server-report-script version bump
 
 Patch release pinning the default `SERVER_REPORT_SCIPT_LINK` in `.env.example` to a newer upstream tag of `luozongbao/server-report-script`. No script, flag, or behavior changes — only the default URL changed.

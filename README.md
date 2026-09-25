@@ -18,6 +18,8 @@ A single Bash script that brings a fresh Ubuntu/Debian server to a sane producti
 
 The script is **idempotent** — re-running it won't break anything.
 
+> **v1.2.0 — bug-fix release.** Three silent bugs are fixed (timezone/hostname `env_or_prompt` capture, call-site argument order, server-report installer losing `$SUDO_USER`). A regression test framework ships in `tests/`. No `.env` changes, no flag changes, no behavior changes for sections that worked in v1.1.1. See [RELEASE.md](RELEASE.md) for details.
+
 > **v1.1.0 breaking change**: the `--install-defaults / -p` flag was renamed to `--install-packages / -i`. The `-p` short flag is now used by `--prompt`. Update any scripts or documentation that referenced the old flag.
 
 > **Two invocation modes** — see [Selection rules](#selection-rules) below:
@@ -551,6 +553,23 @@ Set `NONINTERACTIVE=true` for CI / cloud-init / fully unattended runs. The scrip
 4. Skips the SSH key interactive paste — requires `ssh_key.pub` or `SSH_PUBLIC_KEY`.
 
 Validation failures exit with code `2` (distinct from `1` = unexpected error) so orchestration tools can tell them apart.
+
+## Tests
+
+A regression test suite lives in `tests/`. Pure bash, no dependencies, no root, no network — safe to run anywhere:
+
+```bash
+bash tests/run-all.sh           # quiet — summary only
+bash tests/run-all.sh --verbose # show every assertion
+```
+
+Currently covers:
+
+- `env_or_prompt` stdout/stderr split (the "status line leaks into captured value" bug)
+- `env_or_prompt` caller-side argument shape — static audit rejecting any caller that passes a label as the 1st arg
+- server-report section: no `sudo install.sh` invocation, `SUDO_USER=$TARGET_USER` passed inline, explanatory comment present
+
+Each test was verified to fail against the original buggy code and pass against the fix. See [tests/README.md](tests/README.md) for conventions on adding new tests.
 
 ## Tested on
 
