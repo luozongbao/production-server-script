@@ -239,13 +239,13 @@ env_or_prompt() {
   # CLI flag override wins
   if [[ "$key" == "HOSTNAME" ]] && [[ -n "${CLI_HOSTNAME_VALUE:-}" ]]; then
     val="$CLI_HOSTNAME_VALUE"
-    printf '  %s (from CLI)\n' "$val"
+    printf '  %s (from CLI)\n' "$val" >&2
     printf '%s' "$val"
     return 0
   fi
 
   if [[ -n "$val" ]]; then
-    printf '  %s (from .env)\n' "$val"
+    printf '  %s (from .env)\n' "$val" >&2
     printf '%s' "$val"
     return 0
   fi
@@ -462,7 +462,7 @@ section_timezone() {
   section "Timezone"
   current_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "unknown")
   info "Current timezone: $current_tz"
-  new_tz=$(env_or_prompt "TIMEZONE (e.g. Asia/Shanghai, UTC)" "$current_tz") || return 1
+  new_tz=$(env_or_prompt "TIMEZONE" "$current_tz" "TIMEZONE (e.g. Asia/Shanghai, UTC)") || return 1
   validate_timezone "$new_tz" || return 1
   if [[ "$new_tz" != "$current_tz" ]]; then
     timedatectl set-timezone "$new_tz"
@@ -874,7 +874,7 @@ section_apt_upgrade() {
   fi
 
   local apply
-  apply=$(env_or_prompt "APT_UPGRADE (true/false)" "true") || return 1
+  apply=$(env_or_prompt "APT_UPGRADE" "true" "APT_UPGRADE (true/false)") || return 1
   if ! [[ "$apply" =~ ^[Tt]rue$ ]]; then
     info "APT_UPGRADE=$apply — skipping"
     return 0
@@ -1249,9 +1249,22 @@ section_server_report() {
   # lib/ at /usr/local/share/server-report-script/lib/ (0644), and seeds
   # /etc/server-report-script.env (0600) from .env.example. We do NOT need
   # to create any symlinks ourselves.
+  #
+  # IMPORTANT: do NOT wrap this in `sudo`. setup.sh already runs as root
+  # (it checks $EUID -ne 0 at startup). Calling `sudo install.sh` from a
+  # root shell leaves $SUDO_USER empty in the child — sudo only sets
+  # $SUDO_USER when a non-root user invokes it. Upstream install.sh uses
+  # $SUDO_USER (or logname fallback) to find the invoking user and seed
+  # ~/.config/server-report-script/.env. With $SUDO_USER empty and no
+  # login session (we're root), upstream prints:
+  #   "Cannot determine invoking user (no $SUDO_USER ...)"
+  # and skips the per-user config seeding.
+  #
+  # Fix: invoke install.sh directly (we're already root), and pass
+  # $SUDO_USER=$TARGET_USER inline so upstream can find the user.
   if [[ -x "$install_dir/install.sh" ]]; then
-    info "Running upstream installer (sudo $install_dir/install.sh)"
-    if sudo "$install_dir/install.sh"; then
+    info "Running upstream installer (with SUDO_USER=$TARGET_USER)"
+    if SUDO_USER="$TARGET_USER" "$install_dir/install.sh"; then
       ok "Upstream installer finished"
     else
       err "Upstream install.sh exited non-zero — install may be incomplete"
